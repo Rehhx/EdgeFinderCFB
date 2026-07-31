@@ -229,4 +229,4 @@ the season starts: `Unregister-ScheduledTask -TaskName "CFB August Refit"`.
 Claude Code persistent memory for this project lives at `~/.claude/projects/C--Users-pcagm-PycharmProjects-PythonProject14/memory/` — survives model switches and new sessions. `MEMORY.md` is the index; `cfb-predictor-project.md` mirrors much of this file.
 
 ## Keys (.env — never commit)
-CFBD ✓, The Odds API (5M/mo) ✓, OpenAI ✓ (embeddings, not yet wired), Anthropic ✓ (news extraction, working). `.env.example` still contains a real CFBD key the user should blank.
+CFBD ✓, The Odds API (5M/mo) ✓, OpenAI ✓ (embeddings, not yet wired), Anthropic ✓ (news extraction, working). `.env.example` is a blank template (verified 2026-07-31 — the CFBD key that used to be in it is gone; keep every key line blank) and now also carries `ODDS_API_KEY` + `RAW_DIR`, which `config.py` reads but the template had been missing. Project `README.md` covers architecture with collapsible zoom levels.
