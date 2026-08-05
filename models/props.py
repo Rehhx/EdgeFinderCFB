@@ -16,7 +16,6 @@ import numpy as np
 import pandas as pd
 
 from backtest.spread_baseline import consensus_lines
-from features.epa_ratings import load_game_obs
 from ingestion.config import PARQUET_DIR
 
 SEASONS = [2022, 2023, 2024, 2025]
@@ -36,6 +35,22 @@ STATS = {
     "pass_yds": ("qb_share",   "team_pass_att", "ypa", 80),
 }
 THRESH = {"rush_yds": 40, "rec_yds": 30, "receptions": 2.5, "pass_yds": 150}
+
+# Game-script handling for usage shares. See script_factors().
+#   "off"      shares used exactly as observed (the pre-2026-08 behaviour)
+#   "descript" divide each PAST game's share by its realised script factor
+#              before the EWMA -- removes known contamination from the input
+#   "full"     also multiply the projection by E[factor | pregame spread]
+# REJECTED 2026-08-04 and left at "off". The script effect is real but small
+# once measured honestly: a player-fixed-effects fit puts the RB band at ~5%
+# (0.950x at a 30-point win), not the ~20% a raw share/trail_share ratio
+# suggests -- that ratio compares DIFFERENT players, and good teams both blow
+# opponents out and run deeper committees, so most of the apparent effect is
+# roster composition, not script. Head-to-head out-of-sample (backtest/
+# script_shares.py): off +39.6u, full +34.5u, descript +26.1u over 2024-25.
+SCRIPT_MODE = "off"
+SCRIPT_SHARES = {"rush_share": "rush", "tgt_share": "tgt", "qb_share": "qb"}
+SCRIPT_TRAIN_SEASON = 2022
 
 
 def _trail(g: pd.Series) -> pd.Series:
@@ -152,7 +167,204 @@ def player_priors(logs: pd.DataFrame) -> pd.DataFrame:
         both.loc[is_star, "rush_share"] = (
             both.loc[is_star, "rush_share"] + star["bump"]).clip(upper=0.8)
 
-    return both.rename(columns={c: f"prior_{c}" for c in carry})
+    out = both.rename(columns={c: f"prior_{c}" for c in carry})
+
+    # Vacated share: a returning player whose team-mates' usage LEFT should
+    # carry a bigger prior. Departures previously just deleted the leaver's row
+    # and the share evaporated. Roster-based, so it is known pregame.
+    if VACATED_MODE == "on":
+        try:
+            vac = pd.read_parquet(PARQUET_DIR / "vacated_share.parquet")
+        except FileNotFoundError:
+            print("WARNING: vacated_share.parquet missing — run "
+                  "features.vacated_share; priors left unadjusted.")
+            return out
+        coefs = fit_vacated(out, logs, vac)
+        if coefs:
+            print("vacated-share slopes (mean-1 multiplier, fit "
+                  f"{VAC_FIT_SEASON}):",
+                  {k: round(v["slope"], 3) for k, v in coefs.items()})
+        out = out.merge(vac, on=["season", "team_id"], how="left")
+        for tag, (pcol, _, vcol) in VAC_SPEC.items():
+            if tag not in coefs or pcol not in out.columns:
+                continue
+            out[pcol] = out[pcol] * _vac_mult(out[vcol], coefs[tag])
+        out = out.drop(columns=[c for c in vac.columns
+                                if c.startswith("vac_") and c in out.columns])
+    return out
+
+
+def game_margins() -> pd.DataFrame:
+    """(game_id, team_id) -> own-team final margin, plus the true home_id.
+
+    Sourced from the CFBD games table, NOT from play-by-play. 4.9% of
+    player-game rows have no PBP row, and home_id was previously taken from
+    PBP; when it came back NaN the `team_id == home_id` test was False for
+    BOTH sides, so both were handed the away-side spread. 144 games had their
+    two teams recorded as the same-size underdog, which then fed the volume
+    model with the favourite's sign flipped.
+    """
+    from ingestion.config import CFBD_PARQUET_DIR
+    gs = []
+    for s in SEASONS:
+        try:
+            g = pd.read_parquet(CFBD_PARQUET_DIR / f"games_{s}.parquet")
+        except FileNotFoundError:
+            continue
+        gs.append(g[["id", "homeId", "awayId", "homePoints", "awayPoints"]])
+    g = pd.concat(gs).dropna(subset=["homeId", "awayId"])
+    pts = g.homePoints.notna() & g.awayPoints.notna()
+    long = pd.concat([
+        g.assign(team_id=g.homeId, is_home=1,
+                 margin=np.where(pts, g.homePoints - g.awayPoints, np.nan)),
+        g.assign(team_id=g.awayId, is_home=0,
+                 margin=np.where(pts, g.awayPoints - g.homePoints, np.nan))])
+    long = long.rename(columns={"id": "game_id", "homeId": "home_id"})
+    return long[["game_id", "team_id", "home_id", "is_home", "margin"]].astype(
+        {"game_id": "int64", "team_id": "int64", "home_id": "int64"})
+
+
+def script_factors(df: pd.DataFrame) -> dict:
+    """How a player's SHARE of his team's work responds to game script.
+
+    A starter's share is not a constant he carries between games. It collapses
+    when his team is blowing the opponent out -- he is on the bench in the
+    fourth quarter -- and swells when the team is behind, because the QB throws
+    all game and the lead back keeps whatever carries remain. Measured band on
+    realised margin (observed share / trailing share):
+
+        RB carries    1.154 (lost 14-25)  ->  0.944 (won 25+)
+        WR/TE targets 1.141 (won 4-14)    ->  1.033 (won 25+)
+        QB attempts   1.322 (lost 14-25)  ->  1.053 (won 25+)
+
+    The trailing EWMA averages over whatever scripts a player happened to draw,
+    so that contamination rides into every projection. It is also why the bias
+    is worst early: September blowout wins depress the very shares that the
+    EWMA then carries into the competitive games we bet.
+
+    Fitted as a player-fixed-effects regression of log(share) on a quadratic in
+    margin -- holding the player constant, so the league-wide level bias in
+    shares cannot leak into the script term. Normalised to mean 1 on the train
+    season, so de-scripting changes the SHAPE of a usage history, never its
+    level. Fit on SCRIPT_TRAIN_SEASON only; every tested season stays
+    out-of-sample.
+    """
+    out = {}
+    tr = df[(df.season == SCRIPT_TRAIN_SEASON) & df.margin.notna()]
+    for share, tag in SCRIPT_SHARES.items():
+        t = tr[(tr[share] > 0) & tr[share].notna()].copy()
+        t["ly"] = np.log(t[share])
+        # within-player demeaning: the coefficient is identified off the same
+        # player across different scripts, not off who plays in blowouts
+        t["dy"] = t.ly - t.groupby(["season", "team_id", "player"]).ly.transform("mean")
+        keep = t.groupby(["season", "team_id", "player"]).ly.transform("size") >= 3
+        t = t[keep]
+        m = t.margin.values / 10.0          # scale so the quadratic is tame
+        X = np.column_stack([m, m ** 2])
+        beta, *_ = np.linalg.lstsq(X, t.dy.values, rcond=None)
+
+        f_tr = np.exp(X @ beta)
+        norm = f_tr.mean()
+        out[tag] = {"beta": [float(b) for b in beta], "norm": float(norm)}
+
+        # forward factor: E[f | pregame spread]. Fitted by regressing the
+        # realised factor on a quadratic in the spread, which integrates over
+        # margin uncertainty automatically -- and that uncertainty is large
+        # (residual sd of margin given the spread is 21.1 points), which is
+        # exactly why the forward term is far weaker than the historical one.
+        s = tr.dropna(subset=["team_spread"]).drop_duplicates(
+            ["game_id", "team_id"])
+        sm = s.margin.values / 10.0
+        fs = np.exp(np.column_stack([sm, sm ** 2]) @ beta) / norm
+        sp = s.team_spread.values / 10.0
+        Xs = np.column_stack([sp, sp ** 2, np.ones(len(sp))])
+        gam, *_ = np.linalg.lstsq(Xs, fs, rcond=None)
+        out[tag]["gamma"] = [float(b) for b in gam]
+    return out
+
+
+def _script_f(margin, coef: dict):
+    m = np.asarray(margin, float) / 10.0
+    f = np.exp(coef["beta"][0] * m + coef["beta"][1] * m ** 2) / coef["norm"]
+    return np.where(np.isnan(m), 1.0, f)
+
+
+def _script_fwd(spread, coef: dict):
+    s = np.asarray(spread, float) / 10.0
+    g = coef["gamma"]
+    f = g[0] * s + g[1] * s ** 2 + g[2]
+    return np.where(np.isnan(s), 1.0, f)
+
+
+# Vacated share: boost a returning player's season prior when his team-mates'
+# usage left. Fitted, never assumed — see fit_vacated().
+#   "off"  season priors used as-is
+#   "on"   priors scaled by the fitted, mean-1 vacancy multiplier
+#
+# REJECTED 2026-08-05, left "off". backtest/vacated_ab.py, OOS 2024-25:
+#     off  393 bets  +14.4% ROI  +40.5 u/szn   (2024 +42.0, 2025 +39.0)
+#     on   398 bets  +10.0% ROI  +24.2 u/szn   (2024 +37.7, 2025 +10.7)
+# The underlying effect IS real — a 38% monotone swing in returning players'
+# usage across vacancy quartiles, roster-measured, slopes +0.63/+0.76/+0.76
+# consistent across targets/carries/attempts. It just does not survive the
+# pipeline. MAE is flat (rush 30.88->30.75, pass 75.54->76.75 WORSE), i.e. the
+# adjustment MOVES projections without making them more accurate, and props bet
+# selection is exquisitely sensitive to that (cf. backtest/props_blend_sweep.py,
+# where one grid step of the market-blend weight swung the season 30-54 units).
+# Early season, where it should help most, does not rescue it: pooled ROI rises
+# +4.1%->+4.7% but the season split WORSENS (2024 +0.8% -> -2.7%).
+# Worth revisiting when a 4th season of roster data exists; the mechanism is
+# sound, the estimate is too noisy at n=272-832 to pay for itself.
+VACATED_MODE = "off"
+VAC_FIT_SEASON = 2023          # 2022 has no roster, so it cannot be the fit yr
+VAC_SPEC = {"tgt": ("prior_tgt_share", "targets", "vac_tgt"),
+            "rush": ("prior_rush_share", "rush_att", "vac_rush"),
+            "qb": ("prior_qb_share", "pass_att", "vac_pass")}
+
+
+def fit_vacated(pri: pd.DataFrame, logs: pd.DataFrame,
+                vac: pd.DataFrame) -> dict:
+    """Fit log(actual season share / prior share) ~ vacated, on ONE season.
+
+    ⚠️ Only the SLOPE is kept, and the multiplier is normalised to mean 1 on
+    the fit season. The raw intercept is large and negative (multipliers of
+    0.53-0.74 at average vacancy), i.e. season priors systematically
+    over-project share — but that is a LEVEL correction, not a vacancy one, and
+    backtest/props_vs_book.py already refits `actual ~ a + b*proj` downstream.
+    Shipping the intercept here would double-count it and then have it partly
+    re-absorbed, changing far more than the effect that was actually validated.
+    Same discipline as the game-script factors: change the SHAPE, not the level.
+
+    Fitted on VAC_FIT_SEASON (2023), which is already the pricing calibration
+    season, so 2024 and 2025 stay fully out-of-sample.
+    """
+    tot = logs.groupby(["season", "team_id"], as_index=False).agg(
+        **{f"T_{k}": (c, "sum") for k, (_, c, _) in VAC_SPEC.items()})
+    act = logs.groupby(["season", "team_id", "player"], as_index=False).agg(
+        **{k: (c, "sum") for k, (_, c, _) in VAC_SPEC.items()})
+    act = act.merge(tot, on=["season", "team_id"])
+    m = pri.merge(act, on=["season", "team_id", "player"]).merge(
+        vac, on=["season", "team_id"], how="inner")
+
+    out = {}
+    for tag, (pcol, _, vcol) in VAC_SPEC.items():
+        m[f"a_{tag}"] = m[tag] / m[f"T_{tag}"].clip(lower=1)
+        s = m[(m.season == VAC_FIT_SEASON) & (m[pcol] > 0.05)
+              & (m[f"a_{tag}"] > 0)]
+        if len(s) < 80:
+            continue
+        y = np.log(s[f"a_{tag}"] / s[pcol]).values
+        X = np.column_stack([s[vcol].values, np.ones(len(s))])
+        beta, *_ = np.linalg.lstsq(X, y, rcond=None)
+        out[tag] = {"slope": float(beta[0]), "vbar": float(s[vcol].mean())}
+    return out
+
+
+def _vac_mult(vac_col, coef: dict):
+    """Mean-1 multiplier: exp(slope * (vacated - mean vacated))."""
+    v = np.asarray(vac_col, float)
+    mult = np.exp(coef["slope"] * (v - coef["vbar"]))
+    return np.where(np.isnan(v), 1.0, mult)
 
 
 def build_table() -> pd.DataFrame:
@@ -200,13 +412,38 @@ def build_table() -> pd.DataFrame:
     df["catch"] = df.receptions / df.targets.replace(0, np.nan)
     df["ypa"] = df.pass_yds / df.pass_att.replace(0, np.nan)
 
+    # Realised margin + closing spread are needed BEFORE the trailing EWMAs,
+    # because the de-scripting has to happen on each past game's share while
+    # it is still a single observation.
+    df = df.merge(game_margins(), on=["game_id", "team_id"], how="left")
+    obs_lines = pd.concat([consensus_lines(s).assign(season=s)
+                           for s in SEASONS])[["id", "spread"]]
+    df = df.merge(obs_lines, left_on="game_id", right_on="id", how="left")
+    # a failed merge must yield NaN, never a silently flipped sign -- rows with
+    # no team_spread are dropped in project()
+    df["team_spread"] = np.where(
+        df.is_home == 1, df.spread,
+        np.where(df.is_home == 0, -df.spread, np.nan))
+
+    script = script_factors(df) if SCRIPT_MODE != "off" else {}
+    if script:
+        print("script factors (log-share response to margin, per 10 pts):",
+              {k: [round(b, 3) for b in v["beta"]] for k, v in script.items()})
+
+    # de-script each observed share against the game it was recorded in, so the
+    # EWMA below runs over a cleaned series
+    for c, tag in SCRIPT_SHARES.items():
+        df[f"f_{tag}"] = _script_f(df.margin, script[tag]) if script else 1.0
+        df[f"{c}_ds"] = df[c] / df[f"f_{tag}"]
+
     df = df.sort_values(["season", "player", "team_id", "week"])
     pg = df.groupby(["season", "team_id", "player"])
     df["prior_games"] = pg.cumcount()
     for c in ("rush_share", "tgt_share", "qb_share", "ypc", "ypt", "catch",
               "ypa", "rush_yds", "rec_yds", "receptions", "pass_yds",
               "rush_att", "targets", "pass_att"):
-        df[f"trail_{c}"] = pg[c].transform(_trail)
+        src = f"{c}_ds" if f"{c}_ds" in df.columns else c
+        df[f"trail_{c}"] = pg[src].transform(_trail)
     df["cum_rush_att"] = pg.rush_att.transform(lambda s: s.shift(1).cumsum())
     df["cum_targets"] = pg.targets.transform(lambda s: s.shift(1).cumsum())
     df["cum_pass_att"] = pg.pass_att.transform(lambda s: s.shift(1).cumsum())
@@ -273,34 +510,52 @@ def build_table() -> pd.DataFrame:
     except FileNotFoundError:
         df["trail_ppa_all"] = np.nan
 
-    # closing spread as game-script input (positive = this team is a dog)
-    obs = load_game_obs(SEASONS)
-    home = obs.groupby("game_id", as_index=False).home_id.first()
-    lines = pd.concat([consensus_lines(s).assign(season=s)
-                       for s in SEASONS])[["id", "spread"]]
-    df = df.merge(home, on="game_id", how="left").merge(
-        lines, left_on="game_id", right_on="id", how="left")
-    df["team_spread"] = np.where(df.team_id == df.home_id, df.spread, -df.spread)
+    # team_spread (the game-script input, positive = this team is a dog) is
+    # built near the top of this function, before the trailing EWMAs.
     return df
 
 
-def project(df: pd.DataFrame) -> pd.DataFrame:
+def fit_volume_coefs(train: pd.DataFrame) -> dict:
+    """Team-volume model: actual attempts ~ trailing attempts + spread.
+
+    One row per TEAM-game. This was previously groupby("game_id").first() over
+    PLAYER rows, which kept a single arbitrary side of each game, so the fit
+    depended on row order: a 3.5% change in upstream inputs reshuffled which
+    teams trained the model, moved the coefficients in the third decimal, and
+    swung the graded book by ~40 units/season. Half the sample, and unstable.
+    """
+    out = {}
+    t0 = train.drop_duplicates(["game_id", "team_id"])
+    for c in ("team_rush_att", "team_pass_att"):
+        t = t0.dropna(subset=[f"trail_{c}", "team_spread"])
+        X = np.column_stack([t[f"trail_{c}"], t.team_spread, np.ones(len(t))])
+        out[c], *_ = np.linalg.lstsq(X, t[c], rcond=None)
+    return out
+
+
+def project(df: pd.DataFrame, vol_coefs: dict | None = None,
+            write_coefs: bool = True) -> pd.DataFrame:
+    """Project every stat. `vol_coefs` overrides the fitted team-volume model
+    so backtest/props_stability.py can resample it; `write_coefs=False` keeps
+    an experiment from overwriting production model_coefs.json."""
     train = df[df.season == 2022]  # earliest; keeps 2023+ fully out-of-sample
     lg = {c: train[c].mean() for c in ("ypc", "ypt", "catch", "ypa")}
 
-    # volume models fitted on 2023: actual att ~ trailing att + spread
-    vol_coefs = {}
-    for c in ("team_rush_att", "team_pass_att"):
-        t = train.groupby("game_id").first()
-        t = t.dropna(subset=[f"trail_{c}", "team_spread"])
-        X = np.column_stack([t[f"trail_{c}"], t.team_spread, np.ones(len(t))])
-        vol_coefs[c], *_ = np.linalg.lstsq(X, t[c], rcond=None)
-    print("volume coefs [trail, spread, const]:",
-          {k: v.round(2).tolist() for k, v in vol_coefs.items()})
-    from ingestion.config import save_coefs
-    save_coefs("prop_volume", {
-        "rush": [float(x) for x in vol_coefs["team_rush_att"]],
-        "pass": [float(x) for x in vol_coefs["team_pass_att"]]})
+    # Volume models: actual att ~ trailing att + spread, fitted on the train
+    # season. One row per TEAM-game. This used to be groupby("game_id").first()
+    # over PLAYER rows, which kept a single arbitrary side of each game and so
+    # depended on row order -- a 3.5% change in upstream inputs reshuffled which
+    # teams trained the model, moved the coefficients in the third decimal, and
+    # swung the graded book by ~40 units/season. Half the sample, and unstable.
+    if vol_coefs is None:
+        vol_coefs = fit_volume_coefs(train)
+        print("volume coefs [trail, spread, const]:",
+              {k: np.round(v, 3).tolist() for k, v in vol_coefs.items()})
+    if write_coefs:
+        from ingestion.config import save_coefs
+        save_coefs("prop_volume", {
+            "rush": [float(x) for x in vol_coefs["team_rush_att"]],
+            "pass": [float(x) for x in vol_coefs["team_pass_att"]]})
 
     d = df[df.season.isin(TEST_SEASONS)
            & df.week.between(1, 15)
@@ -324,16 +579,33 @@ def project(df: pd.DataFrame) -> pd.DataFrame:
     opp_rush = (d.trail_ypc_allowed / lg["ypc"]).clip(0.8, 1.25) ** 0.5
     opp_pass = (d.trail_ypa_allowed / lg["ypa"]).clip(0.8, 1.25) ** 0.5
 
-    d["proj_rush_yds"] = (d.trail_rush_share * d.exp_team_rush_att
+    # Forward re-scripting: the trailing shares are now script-neutral, so
+    # optionally push them back toward the script this game is expected to
+    # produce. Deliberately separable from de-scripting -- the historical term
+    # uses a margin we KNOW, this one uses a spread that leaves a 21.1-point
+    # residual sd on margin, and it is the half that risks merely agreeing
+    # with the book more (cf. the opponent-adjusted defense EPA rejection).
+    if SCRIPT_MODE == "full":
+        script = script_factors(df)
+        rush_f = _script_fwd(d.team_spread, script["rush"])
+        tgt_f = _script_fwd(d.team_spread, script["tgt"])
+        qb_f = _script_fwd(d.team_spread, script["qb"])
+    else:
+        rush_f = tgt_f = qb_f = 1.0
+    d["share_rush"] = d.trail_rush_share * rush_f
+    d["share_tgt"] = d.trail_tgt_share * tgt_f
+    d["share_qb"] = d.trail_qb_share * qb_f
+
+    d["proj_rush_yds"] = (d.share_rush * d.exp_team_rush_att
                           * blend(d.trail_ypc, d.cum_rush_att, lg["ypc"], 40)
                           * opp_rush.fillna(1))
-    d["proj_targets"] = d.trail_tgt_share * d.exp_team_pass_att
+    d["proj_targets"] = d.share_tgt * d.exp_team_pass_att
     d["proj_receptions"] = d.proj_targets * blend(
         d.trail_catch, d.cum_targets, lg["catch"], 15)
     d["proj_rec_yds"] = (d.proj_targets
                          * blend(d.trail_ypt, d.cum_targets, lg["ypt"], 25)
                          * opp_pass.fillna(1))
-    d["proj_pass_yds"] = (d.trail_qb_share * d.exp_team_pass_att
+    d["proj_pass_yds"] = (d.share_qb * d.exp_team_pass_att
                           * blend(d.trail_ypa, d.cum_pass_att, lg["ypa"], 80)
                           * opp_pass.fillna(1))
     return d

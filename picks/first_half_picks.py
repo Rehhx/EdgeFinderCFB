@@ -50,6 +50,19 @@ TIER, UNITS = "STANDARD", 1.0
 # line at a flat 56.8% of the full spread — a derived-line shortcut.
 BIGDOG_TIER, BIGDOG_UNITS = "BIG-DOG 1H", 2.0
 BIGDOG_MIN_SPREAD, BIGDOG_MIN_EDGE = 17.0, 6.0
+# The BIG-DOG 1H play is NOT capped at week 5 (the STANDARD 1H tier above is).
+# backtest/h1_saturation.py showed the same bounded-quantity mispricing as the
+# Q1 spread: books derive the 1H line at a flat 0.573 x full (R^2 0.975) while
+# the dog's REALISED 1H share falls 0.647 -> 0.413 as the spread grows, because
+# a half holds only ~7-8 possessions a side. Over-grant: -0.17 pts at a 13-pt
+# spread, +3.58 at 23, +7.32 at 37.
+#   >=17 wks1-5           43/szn  65.1%  +24.8%   21.3 u/szn   (old rule)
+#   >=17 all weeks        69/szn  63.6%  +21.8%   30.0 u/szn   (wks6+ 2024 -4.6%)
+#   >=17 wk1-5 + >=21 wk6+ 59/szn 65.7%  +25.9%   30.8 u/szn   <- SHIPPED
+# The late-season slice needs the bigger spread: >=21 in weeks 6-15 is +29.0%
+# with all three seasons positive, whereas 17-21 late is the weak link.
+BIGDOG_LATE_WEEK = 6
+BIGDOG_LATE_SPREAD = 21.0
 
 
 def _full_game_context() -> dict:
@@ -106,8 +119,14 @@ def run() -> pd.DataFrame:
     if not df.empty:
         fav_home = df.fg_spread < 0
         dog_side = (df.fg_edge > 0) != fav_home
-        df["big_dog"] = (dog_side & (df.fg_spread.abs() >= BIGDOG_MIN_SPREAD)
+        from picks.prop_picks import current_week
+        wk = current_week() or 1
+        # weeks 6+ require the bigger spread (see BIGDOG_LATE_SPREAD note)
+        min_spread = (BIGDOG_LATE_SPREAD if wk >= BIGDOG_LATE_WEEK
+                      else BIGDOG_MIN_SPREAD)
+        df["big_dog"] = (dog_side & (df.fg_spread.abs() >= min_spread)
                          & (df.fg_edge.abs() >= BIGDOG_MIN_EDGE)).fillna(False)
+        df.attrs["week"], df.attrs["min_spread"] = wk, min_spread
     print(f"1H spreads on board: {len(df)} | credits left {client.remaining()}")
     return df
 
@@ -133,14 +152,22 @@ def main() -> None:
         f"{len(bigdog)} **BIG-DOG 1H** ({BIGDOG_UNITS:g}u) + {len(std)} "
         f"{TIER} ({UNITS:g}u).\n\n"
         "| tier | filter | 3-season ATS | ROI | size |\n|---|---|---|---|---|\n"
-        "| BIG-DOG 1H | full-game spread ≥17 & model on dog ≥6, bet the 1H | "
-        "**64.8%** (125 bets, 3/3 seasons) | +23.7% | 2u |\n"
+        f"| BIG-DOG 1H | full spread ≥{BIGDOG_MIN_SPREAD:g} (wks 1–5) or "
+        f"≥{BIGDOG_LATE_SPREAD:g} (wks {BIGDOG_LATE_WEEK}+) & model on dog ≥6 | "
+        "**65.7%** (178 bets, 3/3 seasons) | +25.9% | 2u |\n"
         "| STANDARD | any side, 1H edge ≥2 | 57.8% (469 bets) | +10.3% | 1u |\n\n"
-        "*Big-dog covers are front-loaded (~3.6 pts in the 1H vs ~0.9 in the "
-        "2H) while books set the 1H line at a flat 56.8% of the full spread — "
-        "a derived-line shortcut. Betting these on the 1H beats the full game "
-        "(64.8% vs 62.4% on the same games).*\n\n"
-        "**Validated: weeks 1-5 only — 57.8% ATS, +10.3% ROI, positive in "
+        "*Books derive the 1H line at a flat 0.573 × the full spread "
+        "(R²=0.975), but the dog's realised 1H share FALLS from 0.647 to 0.413 "
+        "as the spread grows — a half holds only ~7–8 possessions a side, so "
+        "the 1H margin saturates while the full-game margin does not. The "
+        "book over-grants the dog +3.6 pts at a 23-point spread and +7.3 at "
+        "37.*\n\n"
+        "⚠️ **Do not also bet the Q1 line on the same game.** Q1 and 1H "
+        "outcomes agree 76% of the time (r=+0.51); 2u on each is closer to a "
+        "4u single position than to two bets. Pick one — Q1 grades better at "
+        "spreads ≥25 (+44.0% vs +26.7%), 1H better at 21–25 (+23.1% vs "
+        "+11.4%).\n\n"
+        "**The STANDARD tier below is weeks 1-5 only — 57.8% ATS, +10.3% ROI, positive in "
         "all 3 seasons (55%/60%/59%). Take EVERY side; segment tests found "
         "no robust sub-tier (a dog-side filter actually lowers it to 55.7%). "
         "No edge weeks 6-15 — stop betting these after week 5.**\n\n"

@@ -24,8 +24,9 @@ SEASON = 2026
 
 
 COLUMNS = ["placed_at", "market", "game", "commence", "home_school",
-           "away_school", "pick", "side", "line", "price", "stake",
-           "model_p", "edge", "stat", "player", "status", "pnl", "clv_pts"]
+           "away_school", "pick", "side", "line", "price", "stake", "unit_usd",
+           "model_p", "edge", "stat", "player", "status", "pnl", "clv_pts",
+           "legs"]
 
 
 def load_ledger() -> pd.DataFrame:
@@ -51,8 +52,59 @@ def _school(name: str, match) -> str | None:
     return m.school.iloc[0] if len(m) else None
 
 
+# --- compounding bankroll -------------------------------------------------
+# Stakes are a % of the CURRENT bankroll, not the starting one. This is the
+# single biggest free lever we have: backtest/growth_paths.py puts flat 2% at a
+# $1,814 median and compounded 2% at $1,990, with no new bets and no extra
+# per-bet risk. Every row records the dollar value of 1u AT PLACEMENT TIME, so
+# the history stays gradeable even as the unit size moves.
+STARTING_BANKROLL = 1000.0
+UNIT_PCT = 0.04            # 4% — the growth-path plan; 2% is the safe setting
+# Q1 is a low-limit market. The cap is in DOLLARS and is the binding constraint
+# on compounding: measured P($5k) runs 42.1% at a $25 cap, 46.6% at $50, 57.0%
+# at $200 and only 57.9% at $500. Spread Q1 across books to reach ~$200; past
+# that it stops mattering.
+Q1_MAX_USD = 200.0
+
+
+def current_bankroll(led: pd.DataFrame | None = None) -> float:
+    """Starting bankroll plus realised dollar P&L. Open bets are not counted."""
+    led = load_ledger() if led is None else led
+    if led.empty or "unit_usd" not in led.columns:
+        return STARTING_BANKROLL
+    s = led[led.status.isin(["won", "lost", "push"])]
+    if s.empty:
+        return STARTING_BANKROLL
+    return STARTING_BANKROLL + float(
+        (s.pnl.fillna(0.0) * s.unit_usd.fillna(0.0)).sum())
+
+
+def unit_usd(led: pd.DataFrame | None = None) -> float:
+    """Dollar value of 1 unit right now."""
+    return round(current_bankroll(led) * UNIT_PCT, 2)
+
+
+def _stake_usd(market: str, stake_units: float, u: float) -> float:
+    """Per-unit dollars for a row, honouring the Q1 dollar cap."""
+    if market.startswith("q1") and stake_units > 0:
+        return round(min(u, Q1_MAX_USD / stake_units), 2)
+    return u
+
+
+def _payout_dec(american: float) -> float:
+    """Profit per 1 unit staked at an American price."""
+    if not np.isfinite(american):
+        return 100 / 110
+    return 100 / abs(american) if american < 0 else american / 100
+
+
 def _append(led: pd.DataFrame, rows: list[dict]) -> pd.DataFrame:
     new = pd.DataFrame(rows)
+    if len(new):
+        u = unit_usd(led)
+        new["unit_usd"] = [
+            _stake_usd(str(r.get("market", "")), float(r.get("stake", 1.0) or 0), u)
+            for r in rows]
     if len(led):
         dupe_keys = led[["market", "pick", "commence"]].apply(tuple, axis=1)
         new = new[~new[["market", "pick", "commence"]].apply(tuple, axis=1)
@@ -108,6 +160,68 @@ def import_1h() -> None:
         "model_p": np.nan, "edge": float(abs(r.edge)),
         "status": "open", "pnl": np.nan, "clv_pts": np.nan,
     } for r in plays.itertuples()]
+    save_ledger(_append(load_ledger(), rows))
+
+
+def import_q1() -> None:
+    """Log Q1 big-dog plays (the validated market-structure edge).
+
+    No model is involved — the pick is purely "underdog on the Q1 line when the
+    full spread is big", so there is no model_p or edge to record. Stake comes
+    from the tier (PREMIUM |spread|>=25 = 2u).
+    """
+    from picks.q1_picks import run as q1_run
+    df = q1_run()
+    if df.empty:
+        print("no Q1 lines posted yet — run on game week.")
+        return
+    teams = pd.read_parquet(CFBD_PARQUET_DIR / "teams_fbs.parquet")
+    id2school = dict(zip(teams.id, teams.school))
+    now = datetime.now(timezone.utc).isoformat()
+    rows = [{
+        "placed_at": now, "market": "q1_spread",
+        "game": f"{r.away} @ {r.home}", "commence": r.commence,
+        "home_school": id2school.get(r.home_id),
+        "away_school": id2school.get(r.away_id),
+        "pick": f"{r.dog} Q1 {r.q1_line:+g}",
+        "side": r.dog_side,
+        "line": float(r.q1_line), "price": float(r.price),
+        "stake": float(r.units),
+        "model_p": np.nan, "edge": np.nan,
+        "status": "open", "pnl": np.nan, "clv_pts": np.nan,
+    } for r in df.itertuples()]
+    save_ledger(_append(load_ledger(), rows))
+
+
+def import_teasers() -> None:
+    """Log 2-team teasers on BIG-DOG 1H legs (backtest/teasers.py: 83.8% hit,
+    +30.3% EV at +10 pts, validated on real same-week pairs).
+
+    Legs are stored as JSON in `legs` so settle() can grade each one against
+    its own TEASED number — the parlay settler cannot be reused here, because
+    it matches leg text against settled singles and a teased line is not the
+    line any single was placed at.
+    """
+    import json
+    from picks.teaser_picks import build
+    df = build()
+    if df.empty:
+        print("no teaser-eligible 1H legs yet — run on game week.")
+        return
+    now = datetime.now(timezone.utc).isoformat()
+    rows = [{
+        "placed_at": now, "market": "teaser2",
+        "game": f"{r.game1} + {r.game2}", "commence": r.commence,
+        "home_school": np.nan, "away_school": np.nan,
+        "pick": f"{r.leg1}; {r.leg2}", "side": np.nan,
+        "line": float(r.tease_pts), "price": float(r.price),
+        "stake": float(r.units), "model_p": np.nan, "edge": np.nan,
+        "status": "open", "pnl": np.nan, "clv_pts": np.nan,
+        "legs": json.dumps([
+            {"home": r.home1, "away": r.away1, "side": r.side1, "line": r.line1},
+            {"home": r.home2, "away": r.away2, "side": r.side2, "line": r.line2},
+        ]),
+    } for r in df.itertuples()]
     save_ledger(_append(load_ledger(), rows))
 
 
@@ -244,10 +358,23 @@ def settle() -> None:
 
     # first-half scores (official quarter line scores) for 1h_spread bets
     h1 = {}
-    if (led.status == "open").any() and (led.market == "1h_spread").any():
+    needs_h1 = led.market.astype(str).str.startswith(("1h_spread", "teaser"))
+    if (led.status == "open").any() and needs_h1.any():
         from features.first_half import one_half_scores
         for r in one_half_scores([SEASON]).itertuples():
             h1[(r.homeTeam, r.awayTeam)] = r.h1_margin
+
+    # first-QUARTER margins for q1_spread bets, from the same official
+    # lineScores array (element 0). Graded on CFBD finals, never on PBP.
+    q1 = {}
+    if (led.status == "open").any() and (led.market == "q1_spread").any():
+        for r in games[games.homeLineScores.notna()
+                       & games.awayLineScores.notna()].itertuples():
+            try:
+                q1[(r.homeTeam, r.awayTeam)] = float(r.homeLineScores[0]) \
+                    - float(r.awayLineScores[0])
+            except (TypeError, IndexError, ValueError):
+                continue
 
     n = 0
     # parlays settle LAST (they depend on their legs' outcomes)
@@ -275,6 +402,49 @@ def settle() -> None:
             elif all(o in ("won", "push") for o in outcomes):
                 led.loc[i, "status"] = "won"
                 led.loc[i, "pnl"] = float(b.line) - 1.0  # decimal payout - stake
+            n += 1
+            continue
+        if str(b.market).startswith("teaser"):
+            # Each leg is graded against its OWN teased number. Every leg must
+            # cover; a push on any leg voids the ticket the way most books
+            # settle a 2-teamer (push+win = no action, not a win).
+            import json
+            try:
+                legs = json.loads(b.legs) if pd.notna(b.legs) else None
+            except (TypeError, ValueError):
+                legs = None
+            if not legs:
+                continue
+            covers = []
+            for lg in legs:
+                hm = h1.get((lg["home"], lg["away"]))
+                if hm is None or pd.isna(hm):
+                    covers = None
+                    break
+                # line is the DOG's teased points; side says which team it is
+                covers.append((hm + lg["line"]) if lg["side"] == "home"
+                              else (-hm + lg["line"]))
+            if covers is None:
+                continue                      # a leg has not been played yet
+            if any(c < 0 for c in covers):
+                led.loc[i, "status"], led.loc[i, "pnl"] = "lost", -1.0
+            elif any(c == 0 for c in covers):
+                led.loc[i, "status"], led.loc[i, "pnl"] = "push", 0.0
+            else:
+                led.loc[i, "status"] = "won"
+                led.loc[i, "pnl"] = _payout_dec(float(b.price))
+            n += 1
+            continue
+        if b.market == "q1_spread":
+            qm = q1.get((b.home_school, b.away_school))
+            if qm is None or pd.isna(qm):
+                continue
+            # b.line is the DOG's points; b.side says which team the dog is
+            cover = (qm + b.line) if b.side == "home" else (-qm + b.line)
+            led.loc[i, "status"] = ("push" if cover == 0
+                                    else "won" if cover > 0 else "lost")
+            led.loc[i, "pnl"] = (0.0 if cover == 0
+                                 else _payout(b.price) if cover > 0 else -1.0)
             n += 1
             continue
         if b.market == "1h_spread":
@@ -348,6 +518,55 @@ def settle() -> None:
     print(f"settled {n} bets")
 
 
+def bankroll() -> None:
+    """Current bankroll, unit size, and progress toward the season target."""
+    led = load_ledger()
+    bank = current_bankroll(led)
+    u = unit_usd(led)
+    growth = bank / STARTING_BANKROLL - 1
+    print(f"\n=== BANKROLL ===")
+    print(f"  start        ${STARTING_BANKROLL:,.0f}")
+    print(f"  current      ${bank:,.2f}   ({growth:+.1%})")
+    print(f"  1u is now    ${u:,.2f}   ({UNIT_PCT:.0%} of current — COMPOUNDING)")
+    print(f"  2u plays     ${2*u:,.2f}")
+    print(f"  Q1 capped at ${Q1_MAX_USD:,.0f} total across books "
+          f"(binding above ${Q1_MAX_USD/2/UNIT_PCT:,.0f} bankroll on 2u)")
+    if led.empty or not led.status.isin(["won", "lost", "push"]).any():
+        print("  no settled bets yet — unit size is still at the opening value")
+    # rows logged before compounding existed carry no unit_usd and would
+    # silently settle for $0. Say so rather than quietly under-counting.
+    if not led.empty:
+        stale = int(led.unit_usd.isna().sum())
+        if stale:
+            print(f"  ⚠️ {stale} row(s) predate compounding and have no "
+                  "unit_usd — they contribute $0. Backfill with "
+                  "`backfill-units` if they are real bets.")
+    open_n = int((led.status == "open").sum()) if not led.empty else 0
+    if open_n:
+        print(f"  ⚠️ {open_n} bets still open — bankroll excludes them until "
+              "they settle")
+
+
+def backfill_units() -> None:
+    """Give pre-compounding rows a unit_usd at the OPENING unit size.
+
+    Only touches rows where it is missing, and uses the opening value rather
+    than today's — those bets were sized before compounding existed, so
+    pretending they were staked at the current unit would invent P&L.
+    """
+    led = load_ledger()
+    miss = led.unit_usd.isna()
+    if not miss.any():
+        print("nothing to backfill")
+        return
+    opening = round(STARTING_BANKROLL * UNIT_PCT, 2)
+    led.loc[miss, "unit_usd"] = [
+        _stake_usd(str(m), float(st) if pd.notna(st) else 1.0, opening)
+        for m, st in zip(led.loc[miss, "market"], led.loc[miss, "stake"])]
+    save_ledger(led)
+    print(f"backfilled {int(miss.sum())} rows at the opening unit ${opening:,.2f}")
+
+
 def report() -> None:
     led = load_ledger()
     if led.empty:
@@ -368,12 +587,17 @@ def report() -> None:
                   f"({be.game}) — {be.edge:.2f} {unit}")
     settled = led[led.status.isin(["won", "lost", "push"])]
     if len(settled):
+        settled = settled.copy()
+        settled["pnl_usd"] = (settled.pnl.fillna(0.0)
+                              * settled.unit_usd.fillna(0.0))
         g = settled.groupby("market").agg(
             bets=("pnl", "size"),
             won=("status", lambda s: (s == "won").sum()),
             pnl_u=("pnl", "sum"), roi=("pnl", "mean"),
+            pnl_usd=("pnl_usd", "sum"),
             clv=("clv_pts", "mean")).round(3)
         print(g.to_string())
+        bankroll()
         print(f"\nTOTAL: {settled.pnl.sum():+.2f}u over {len(settled)} bets "
               f"({settled.pnl.mean() * 100:+.1f}% ROI)")
     day = datetime.now(timezone.utc).date().isoformat()
@@ -401,9 +625,10 @@ def add(args) -> None:
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("cmd", choices=["import-ml", "import-edges",
-                                    "import-props", "import-1h",
-                                    "import-ml-spread", "import-parlay",
-                                    "settle", "report", "add"])
+                                    "import-props", "import-1h", "import-q1",
+                                    "import-ml-spread", "import-parlay", "import-teasers",
+                                    "settle", "report", "bankroll",
+                                    "backfill-units", "add"])
     ap.add_argument("--market", default="ml")
     ap.add_argument("--game", help='"Away Full Name @ Home Full Name"')
     ap.add_argument("--pick", default="")
@@ -414,6 +639,9 @@ if __name__ == "__main__":
     a = ap.parse_args()
     {"import-ml": import_ml, "import-edges": import_edges,
      "import-props": import_props, "import-1h": import_1h,
+     "import-q1": import_q1,
      "import-ml-spread": import_ml_spread, "import-parlay": import_parlay,
-     "settle": settle, "report": report}.get(
+     "import-teasers": import_teasers,
+     "settle": settle, "report": report, "bankroll": bankroll,
+     "backfill-units": backfill_units}.get(
         a.cmd, lambda: add(a))() if a.cmd != "add" else add(a)

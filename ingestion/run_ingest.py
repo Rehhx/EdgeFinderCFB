@@ -34,6 +34,16 @@ CFBD_PULLS = [
     ("returning_2023",       "/player/returning",   {"year": 2023}),
     ("returning_2024",       "/player/returning",   {"year": 2024}),
     ("returning_2025",       "/player/returning",   {"year": 2025}),
+    # Rosters unlock VACATED SHARE — who from last season is NOT back. The
+    # portal alone captures only 17% of vacated target share; the rest is
+    # graduation, draft and attrition, which only a roster reveals. Measured
+    # effect on returning players' week 1-4 usage is a 38% swing, and it is the
+    # most plausible route to making early-season props bettable. See HANDOFF.
+    ("roster_2022",          "/roster",             {"year": 2022}),
+    ("roster_2023",          "/roster",             {"year": 2023}),
+    ("roster_2024",          "/roster",             {"year": 2024}),
+    ("roster_2025",          "/roster",             {"year": 2025}),
+    ("roster_2026",          "/roster",             {"year": 2026}),
 ]
 
 

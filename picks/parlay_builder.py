@@ -26,10 +26,23 @@ import pandas as pd
 
 from ingestion.config import PROJECT_ROOT
 
-# backtested win rates, HAIRCUT for live realism (parlays punish overconfidence)
-PROB = {"big_dog_spread": 0.565, "1h_spread": 0.555}  # backtest 59% / 58%
+# Backtested win rates, HAIRCUT for live realism (parlays punish overconfidence).
+# VALIDATED 2026-08-04 by backtest/growth_paths.py, which built real same-week,
+# different-game parlays from the graded book and settled them properly:
+#   2-leg  38/szn  47.8% win  +77.3% ROI  t=+4.43  (2023 +103%, 2024 +82%, 2025 +86%)
+#   3-leg  23/szn  32.9% win +130.2% ROI  t=+3.28  (+234%, +154%, +99%)
+# All three seasons positive at both sizes. The edge really does multiply:
+# EV_parlay = (1+EV1)(1+EV2)-1, so two +45.7% Q1 legs price near +112%.
+# ⚠️ Legs are NOT perfectly independent — measured weekly win-rate variance is
+# 1.14x what independence predicts, i.e. our big dogs win and lose together a
+# little. That makes true joint probability slightly BELOW p1*p2, so the
+# haircut below is doing real work, not decoration.
+# ⚠️ 2-LEG IS THE RECOMMENDED SIZE. 3-leg has higher EV% but its per-season ROI
+# is decaying (+234 -> +154 -> +99) and 33% hit rate is brutal to sit through.
+PROB = {"big_dog_spread": 0.565, "1h_spread": 0.555,   # backtest 59% / 58%
+        "q1_spread": 0.700}      # Q1 PREMIUM backtests 75.5%; haircut hard
 KELLY_FRACTION = 0.25
-MAX_LEGS = 6
+MAX_LEGS = 4                     # was 6 — nothing beyond 3 legs is defensible
 MIN_LEG_EV = 0.02        # a leg must be clearly +EV to enter a parlay
 DEC_110 = 1.909          # -110 in decimal
 MIN_LEG_PROB = 0.45      # no longshot lottery legs (EV-max would stack them)
@@ -44,8 +57,43 @@ def _dec(american: float) -> float:
 
 
 def gather_legs() -> pd.DataFrame:
-    """Best available +EV leg per game, from the validated-edge markets."""
+    """Best available +EV leg per game, from the validated-edge markets.
+
+    COMPOSITION, measured 2026-08-04 on real graded outcomes (same week,
+    different games, each leg used at most once):
+
+      Q1 PREM x Q1 PREM        19/szn  55.9% win  +103.8% ROI  t=+4.34
+      Q1 PREM x any derived    31/szn  50.0% win   +84.5% ROI  t=+4.39
+      any derived x any        116/szn 43.1% win   +59.4% ROI  t=+6.02
+      Q1 PREM x BIG-DOG 1H     21/szn  42.9% win   +58.2% ROI  t=+2.50
+      1H x 1H                  23/szn  37.1% win   +37.3% ROI  t=+1.73
+      Q1 PREM x PROPS           8/szn  46.2% win   +62.6% ROI  t=+1.78
+
+    All positive in all three seasons. **Q1 legs are the best ingredient by a
+    wide margin** — our best single play squared — and until 2026-08-04 this
+    builder did not gather them at all.
+
+    ⚠️ The 116/szn row is NOT a licence to bet that many. It re-uses each leg
+    ~3x, so one leg losing takes down several parlays AND the single on that
+    same game. Legs are used at most once here, which lands nearer 20-30/szn.
+    """
     legs = []
+
+    # Q1 big-dog lines — our single best play (75.5% at PREMIUM) and therefore
+    # the best parlay ingredient. Model-free by design.
+    try:
+        from picks.q1_picks import run as q1
+        d = q1()
+        if not d.empty:
+            # PREMIUM tier only — that is the 75.5% leg the maths relies on
+            for r in d[d.tier == "PREMIUM Q1"].itertuples():
+                legs.append({"game": f"{r.away} @ {r.home}",
+                             "market": "q1_spread",
+                             "pick": f"{r.dog} Q1 {r.q1_line:+g}",
+                             "dec": _dec(float(r.price)),
+                             "prob": PROB["q1_spread"]})
+    except Exception as e:
+        print(f"(Q1 legs unavailable: {e})")
 
     # big-dog spreads (ml_spread validated plays)
     try:

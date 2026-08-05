@@ -88,6 +88,31 @@ def pull_rosters_2026() -> str:
     return f"{len(r.content) / 1e6:.1f} MB"
 
 
+def pull_cfbd_roster_2026() -> str:
+    """CFBD /roster for 2026 — required for VACATED SHARE in player props.
+
+    Separate from pull_rosters_2026() above, which uses cfbfastR and a
+    different schema. The vacated-share feature keys off CFBD names/teams so
+    it must come from the CFBD endpoint.
+
+    This returned ZERO rows on 2026-08-04 because the roster was not published
+    yet, so it MUST be re-run closer to week 1. Raises if still empty, rather
+    than silently writing an empty parquet that would make every prior-season
+    contributor look departed.
+    """
+    import pandas as pd
+    from ingestion.cfbd_client import CFBDClient
+    from ingestion.config import CFBD_PARQUET_DIR
+    df = pd.json_normalize(CFBDClient().get("/roster", {"year": 2026}))
+    if len(df) < 1000:
+        raise RuntimeError(
+            f"roster_2026 has only {len(df)} rows — not published yet. "
+            "Vacated share CANNOT be computed until this fills; re-run later.")
+    dest = CFBD_PARQUET_DIR / "roster_2026.parquet"
+    df.to_parquet(dest, index=False)
+    return f"{len(df):,} players"
+
+
 def run_module(mod: str) -> str:
     r = subprocess.run([PY, "-m", mod], capture_output=True, text=True,
                        cwd=PROJECT_ROOT, timeout=1800)
@@ -125,6 +150,7 @@ def main() -> None:
 
     data_ok = step("CFBD 2026 pulls", pull_cfbd_2026)
     step("bulk rosters 2026", pull_rosters_2026)
+    step("CFBD roster 2026 (vacated share)", pull_cfbd_roster_2026)
     step("SP+/FPI power ratings", pull_ratings)
     step("wiki staff 2021-2026",
          lambda: run_module("ingestion.scrapers.wiki_staff") and "ran")
