@@ -19,7 +19,7 @@ import numpy as np
 import pandas as pd
 from scipy.stats import gamma, nbinom, norm
 
-from ingestion.config import PARQUET_DIR
+from ingestion.config import CFBD_PARQUET_DIR, PARQUET_DIR
 
 STATS = ["rush_yds", "rec_yds", "receptions", "pass_yds"]
 EV_THRESH = [0.03, 0.05, 0.08, 0.12]
@@ -38,7 +38,22 @@ def consensus_lines() -> pd.DataFrame:
     raw = raw.dropna(subset=["player", "point", "price"])
     raw = raw[raw.price.between(-200, 200)]  # main lines only, no alt ladders
 
+    # ONE EVENT PER PLAYER-WEEK. CFBD's week-0/week-1 overlap means a handful
+    # of (season, week, stat, player) keys span two different events; without
+    # this, the consensus below collapses them and the SAME line is graded
+    # twice against two different games (117 of 14,183 graded rows, 0.83%).
+    # Keep the event the player actually appears in most — quote count is the
+    # tie-break, then the earliest kickoff.
+    ev = (raw.groupby(["season", "week", "stat", "player", "event_id"])
+             .agg(q=("price", "size"), c=("commence", "min")).reset_index()
+             .sort_values(["q", "c"], ascending=[False, True])
+             .drop_duplicates(["season", "week", "stat", "player"]))
+    raw = raw.merge(ev[["season", "week", "stat", "player", "event_id"]],
+                    on=["season", "week", "stat", "player", "event_id"],
+                    how="inner")
+
     # a quotable line = over AND under from the same book at the SAME point
+    kick = ev.set_index(["season", "week", "stat", "player"]).c
     piv = raw.pivot_table(
         index=["season", "week", "stat", "player", "book", "point"],
         columns="side", values="price", aggfunc="first")
@@ -62,6 +77,12 @@ def consensus_lines() -> pd.DataFrame:
         pay_over_best=("pay_over", "max"),    # line shopping: best quoted
         pay_under_best=("pay_under", "max"),
         n_books=("book", "nunique"))
+    # kickoff of the event this line was quoted for — lets the projection merge
+    # pin the RIGHT game when CFBD labels two of a team's games the same week
+    # (its week-0 kickoff weekend is tagged week 1, so 267 player-weeks have
+    # two distinct game_ids and the line would otherwise grade against both).
+    cons = cons.merge(kick.rename("kickoff").reset_index(),
+                      on=["season", "week", "stat", "player"], how="left")
     return cons
 
 
@@ -148,8 +169,21 @@ def run(proj_path=None, write_coefs: bool = True, cal_rng=None,
                            (PARQUET_DIR / "prop_projections.parquet"))
 
     frames = []
+    # game_id + kickoff let a line be pinned to the game it was quoted for
+    sched = {}
+    try:
+        import json
+        for szn in sorted(proj.season.dropna().unique()):
+            g = pd.read_parquet(CFBD_PARQUET_DIR / f"games_{int(szn)}.parquet",
+                                columns=["id", "startDate"])
+            sched.update(dict(zip(g.id.astype("int64"),
+                                  pd.to_datetime(g.startDate, utc=True,
+                                                 format="ISO8601"))))
+    except Exception:
+        sched = {}
+
     for stat in STATS:
-        cols = ["season", "week", "player", stat, f"proj_{stat}"]
+        cols = ["season", "week", "player", "game_id", stat, f"proj_{stat}"]
         mu_col = "mu_rush" if stat == "rush_yds" else "mu_pass"
         if mu_col in proj.columns:
             cols.append(mu_col)
@@ -164,6 +198,19 @@ def run(proj_path=None, write_coefs: bool = True, cal_rng=None,
         pl["mu_total"] = np.nan
 
     m = lines.merge(pl, on=["season", "week", "stat", "player"], how="inner")
+    # PIN THE GAME. CFBD tags its week-0 kickoff weekend as week 1, so 267
+    # player-weeks carry TWO distinct game_ids and a single quoted line was
+    # being graded against BOTH (117 duplicated rows, 0.83%). Keep the game
+    # whose kickoff is nearest the time the line was actually quoted for.
+    if sched and "game_id" in m.columns:
+        gt = m.game_id.map(sched)
+        kt = pd.to_datetime(m.kickoff, utc=True, format="ISO8601",
+                            errors="coerce")
+        m["_gap"] = (gt - kt).abs()
+        m = (m.sort_values("_gap")
+               .drop_duplicates(["season", "week", "stat", "player"],
+                                keep="first")
+               .drop(columns="_gap"))
     print(f"matched player-prop lines: {len(m):,} "
           f"(of {len(lines):,} consensus lines)")
 
@@ -472,7 +519,7 @@ def fit_production() -> None:
           f"{'='*66}")
     run(write_coefs=True, cal_seasons=seasons)
     print("\nwrote props recal/nb_r/blend_w to model_coefs.json for LIVE picks.")
-    print("⚠️ in-sample by construction — do NOT quote the ROI above.")
+    print("[!] in-sample by construction - do NOT quote the ROI above.")
 
 
 TEST_SEASONS = (2023, 2024, 2025)

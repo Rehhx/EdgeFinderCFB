@@ -4,8 +4,10 @@ Math reality: parlaying INDEPENDENT +EV legs compounds the edge (higher EV%)
 but variance explodes and you lose most of them (six 58% legs hit just 4%).
 Parlaying break-even/-EV legs is a guaranteed loser — the vig compounds. So
 this builder:
-  - uses only validated-edge legs (big-dog spreads, 1H spreads, ML value);
-    NEVER props (near-efficient) or totals (dead market);
+  - uses only validated-edge legs. PROPS are now the primary ingredient
+    (the header used to read "NEVER props (near-efficient)" — the audit
+    inverted that: props are the only stable edge, Q1 PREMIUM is -0.7 u/szn);
+    still never totals (dead market) or moneylines (-5% ROI);
   - one leg per game (keeps legs ~independent; correlated same-game legs
     would break the joint-probability math);
   - haircuts each leg's backtest win rate for live realism (errors compound);
@@ -119,6 +121,28 @@ def gather_legs() -> pd.DataFrame:
                              "dec": DEC_110, "prob": PROB["1h_spread"]})
     except Exception:
         pass
+
+    # PROPS legs — now the PRIMARY ingredient. This module was built around Q1
+    # legs ("the best ingredient by a wide margin", 75.5% / +45.7%) and
+    # deliberately excluded props as "near-efficient". The 2026-08-05/06 audit
+    # inverted both premises: Q1 PREMIUM is -0.7 u/szn on the clean sample,
+    # while props are the only play with stable evidence.
+    #
+    # Measured directly on 504 graded props bets (2024-25): CROSS-GAME pairs are
+    # essentially exactly independent — joint hit 36.8% vs 36.8% predicted from
+    # the marginals, lift 0.999 — and pay **+30.0% EV**, week-block bootstrap CI
+    # [+11.3%, +48.6%], positive both seasons. That independence is why the
+    # one-leg-per-game rule below is load-bearing rather than cosmetic.
+    try:
+        from picks.prop_picks import current_week, flag_picks, run as prop_run
+        pdf = prop_run()
+        if not pdf.empty:
+            for r in flag_picks(pdf, current_week()).itertuples():
+                legs.append({"game": r.game, "market": "prop",
+                             "pick": f"{r.player} {r.side} {r.line:g} {r.stat}",
+                             "dec": _dec(r.price), "prob": float(r.conf)})
+    except Exception as e:
+        print(f"(prop legs unavailable: {e})")
 
     # NOTE: moneyline legs intentionally NOT gathered — ML betting backtests
     # at -5% ROI (8 seasons, real prices). Parlaying a -EV leg is a loser.

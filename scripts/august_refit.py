@@ -24,6 +24,7 @@ from ingestion.cfbd_client import CFBDClient
 from ingestion.config import CFBD_PARQUET_DIR, COEFS_PATH, PARQUET_DIR, PROJECT_ROOT
 
 PY = sys.executable
+LIVE_SEASON = 2026
 LOG: list[str] = []
 
 
@@ -37,22 +38,80 @@ def step(name: str, fn) -> bool:
         return False
 
 
+# REQUIRED: nothing can be priced without the schedule and the lines.
+# OPTIONAL: CFBD publishes these late; the callers already degrade (see
+# features/roster_priors.py::roster_features, which falls back to league-median
+# returning production and to NaN OL continuity).
+CFBD_2026 = [
+    # name,             endpoint,             required
+    ("games_2026",      "/games",             True),
+    ("lines_2026",      "/lines",             True),
+    ("portal_2026",     "/player/portal",     False),
+    ("returning_2026",  "/player/returning",  False),
+]
+
+
 def pull_cfbd_2026() -> str:
+    """Pull each 2026 dataset INDEPENDENTLY.
+
+    This used to be one loop that raised on the first empty response, and
+    `returning_2026` was first in it. So while returning production was
+    unpublished — still true on 2026-08-05 — the schedule and the BETTING LINES
+    were never pulled at all, on every weekly run. One unpublished preseason
+    stat silently blocked the two datasets the whole book depends on.
+
+    An empty OPTIONAL pull is now reported and skipped WITHOUT overwriting the
+    last good parquet; an empty REQUIRED pull is the only thing that fails the
+    step. Never write an empty file over real data — a zero-row roster makes
+    every prior-season contributor look departed.
+    """
     c = CFBDClient()
-    out = []
-    for name, ep, params in [
-        ("returning_2026", "/player/returning", {"year": 2026}),
-        ("portal_2026", "/player/portal", {"year": 2026}),
-        ("games_2026", "/games", {"year": 2026}),
-        ("lines_2026", "/lines", {"year": 2026}),
-    ]:
-        data = c.get(ep, params, refresh=True)
-        if name == "returning_2026" and not data:
-            raise RuntimeError("returning production 2026 not published yet")
-        df = pd.json_normalize(data)
-        df.to_parquet(CFBD_PARQUET_DIR / f"{name}.parquet", index=False)
-        out.append(f"{name}={len(df)}")
-    return ", ".join(out) + f" (calls used {c.calls_used()}/1000)"
+    ok, missing, failed = [], [], []
+    for name, ep, required in CFBD_2026:
+        dest = CFBD_PARQUET_DIR / f"{name}.parquet"
+        try:
+            data = c.get(ep, {"year": 2026}, refresh=True)
+        except Exception as e:
+            (failed if required else missing).append(f"{name}({type(e).__name__})")
+            continue
+        if not data:
+            missing.append(f"{name}=unpublished"
+                           + (" **REQUIRED**" if required else ""))
+            if required:
+                failed.append(name)
+            continue
+        # /lines is NESTED (one row per game, a `lines` list per book). It must
+        # be written with the SAME flattener run_ingest uses for 2015-2025, or
+        # picks/paper_trades.py::settle() KeyErrors on spread/overUnder and
+        # Sunday grading dies silently.
+        from ingestion.run_ingest import flatten_lines
+        df = flatten_lines(data) if ep == "/lines" else pd.json_normalize(data)
+        df.to_parquet(dest, index=False)
+        ok.append(f"{name}={len(df)}")
+
+    msg = ", ".join(ok) or "nothing pulled"
+    if missing:
+        msg += " | not yet published: " + ", ".join(missing)
+    msg += f" (calls used {c.calls_used()}/1000)"
+    if failed:
+        raise RuntimeError(f"REQUIRED 2026 data missing: {', '.join(failed)}. {msg}")
+    return msg
+
+
+def pull_pbp_live() -> str:
+    """Re-download the LIVE season's play-by-play. Must run every week.
+
+    `download_season` short-circuits to "cached" whenever the file exists, which
+    is right for a finished season and wrong for the current one — that file
+    GROWS every Saturday. Without a forced re-pull the live season's PBP would
+    freeze at whatever week it was first fetched, and the weekly ratings refit
+    (features/epa_ratings.live_asof) would have nothing new to fit on.
+
+    404s until the season opens; `step()` logs that and retries next run.
+    """
+    from ingestion.bulk_pbp import download_season
+    info = download_season(LIVE_SEASON, force=True)
+    return f"{info.get('rows', 0):,} plays ({info.get('status')})"
 
 
 def pull_ratings() -> str:
@@ -151,6 +210,8 @@ def main() -> None:
     data_ok = step("CFBD 2026 pulls", pull_cfbd_2026)
     step("bulk rosters 2026", pull_rosters_2026)
     step("CFBD roster 2026 (vacated share)", pull_cfbd_roster_2026)
+    step(f"live play-by-play {LIVE_SEASON} (feeds the weekly ratings refit)",
+         pull_pbp_live)
     step("SP+/FPI power ratings", pull_ratings)
     step("wiki staff 2021-2026",
          lambda: run_module("ingestion.scrapers.wiki_staff") and "ran")

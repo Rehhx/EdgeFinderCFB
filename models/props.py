@@ -367,9 +367,59 @@ def _vac_mult(vac_col, coef: dict):
     return np.where(np.isnan(v), 1.0, mult)
 
 
-def build_table() -> pd.DataFrame:
+def build_table(future: pd.DataFrame | None = None) -> pd.DataFrame:
+    """Per (game, player) features. `future` appends synthetic rows for games
+    that have NOT been played, so the SAME trailing-feature machinery serves
+    live picks.
+
+    This exists because `picks/prop_picks.py` used to build its own
+    preseason-only projection — no trailing EWMA, no opponent factor — while
+    `model_coefs.json` shipped recalibration slopes fitted on THIS table. The
+    live book was pricing with a different, weaker model than the one every
+    backtest measured (~+11.6 u/szn vs +56.9).
+
+    It works because `_trail` is `shift(1).ewm(...)`: a row appended for an
+    unplayed game receives the EWMA of the games BEFORE it and contributes
+    nothing to its own features. In week 1 there are no prior games, so every
+    trailing feature is NaN and the prior blend below falls back to the
+    season-opening priors — exactly what the old opening-only path did. One
+    code path is now correct in week 1 AND week 9.
+
+    `future` must carry the logs schema with NaN stats, plus `team_spread`
+    (positive = this team is the underdog) and `opp_id`.
+    """
     logs = pd.read_parquet(PARQUET_DIR / "player_game_logs.parquet")
-    logs = logs[logs.season.isin(SEASONS)]
+    seasons = list(SEASONS)
+    if future is not None and len(future):
+        seasons = sorted(set(seasons) | set(future.season.unique().tolist()))
+    logs = logs[logs.season.isin(seasons)]
+    log_cols = logs.columns.tolist()
+    if future is not None and len(future):
+        # Derived, not hard-coded: any log column that is not part of the key
+        # is a stat, so adding a stat (e.g. touchdowns) cannot silently break
+        # the `fut[keep]` selection below.
+        key_cols = {"season", "week", "game_id", "team_id", "player"}
+        stat_cols = [c for c in log_cols if c not in key_cols]
+        fut = future.copy()
+        for c in stat_cols:                       # unplayed: no stats, ever
+            fut[c] = np.nan
+        # `fut_spread`/`fut_opp` ride along so the known market number and the
+        # known opponent survive the merges below; the CFBD line table has no
+        # row for a game that has not been played.
+        keep = log_cols + ["fut_spread", "fut_opp"]
+        fut = fut.rename(columns={"team_spread": "fut_spread",
+                                  "opp_id": "fut_opp"})[keep]
+        # AS-OF GUARD. Projecting week W must not see week W or later. Drop
+        # any logged row at or after the earliest future week in that season —
+        # otherwise a re-run after kickoff would quietly grade itself on the
+        # game it is pricing, and the acceptance test could not simulate a
+        # past week honestly.
+        for s, w in fut.groupby("season").week.min().items():
+            logs = logs[~((logs.season == s) & (logs.week >= w))]
+        logs = pd.concat([logs, fut], ignore_index=True)
+    logs["fut_spread"] = logs.get("fut_spread", np.nan)
+    logs["fut_opp"] = logs.get("fut_opp", np.nan)
+    logs["_future"] = logs.fut_spread.notna()
 
     key = ["season", "week", "game_id", "team_id"]
     team = logs.groupby(key, as_index=False).agg(
@@ -424,6 +474,9 @@ def build_table() -> pd.DataFrame:
     df["team_spread"] = np.where(
         df.is_home == 1, df.spread,
         np.where(df.is_home == 0, -df.spread, np.nan))
+    # An unplayed game has no CFBD line row and no realised margin, so the
+    # lookup above yields NaN. Use the market number the caller passed in.
+    df["team_spread"] = df.team_spread.fillna(df.fut_spread)
 
     script = script_factors(df) if SCRIPT_MODE != "off" else {}
     if script:
@@ -439,9 +492,21 @@ def build_table() -> pd.DataFrame:
     df = df.sort_values(["season", "player", "team_id", "week"])
     pg = df.groupby(["season", "team_id", "player"])
     df["prior_games"] = pg.cumcount()
+    # WEEKS SINCE THIS PLAYER'S PREVIOUS APPEARANCE. Leak-free: shift(1) only
+    # looks backwards. This is the availability signal the depth charts were
+    # supposed to supply — `depth_charts.parquet` turned out to hold a single
+    # 2026-07 snapshot with no history, and `news_extractions.parquet` has 5
+    # rows, so neither can inform a 2023-25 fit without anachronism.
+    #
+    # A missed game leaves NO log row, so the trailing EWMA silently carries a
+    # stale pre-absence share into the return game as if it were current. The
+    # error is monotone in the gap and stable in every season (rush share bias
+    # at gap>=3: 2023 -0.0704, 2024 -0.0411, 2025 -0.0237) — a returning player
+    # is OVER-projected because his old role is not the one he comes back to.
+    df["gap"] = df.week - pg.week.shift(1)
     for c in ("rush_share", "tgt_share", "qb_share", "ypc", "ypt", "catch",
               "ypa", "rush_yds", "rec_yds", "receptions", "pass_yds",
-              "rush_att", "targets", "pass_att"):
+              "rush_att", "targets", "pass_att", "pass_comp"):
         src = f"{c}_ds" if f"{c}_ds" in df.columns else c
         df[f"trail_{c}"] = pg[src].transform(_trail)
     df["cum_rush_att"] = pg.rush_att.transform(lambda s: s.shift(1).cumsum())
@@ -468,6 +533,9 @@ def build_table() -> pd.DataFrame:
         dfn.rename(columns={"team_id_opp": "opp_id"})[
             key + ["opp_id", "trail_ypc_allowed", "trail_ypa_allowed"]],
         on=key, how="left")
+    # Safety net: `dfn` pairs the two sides of a game, so it only resolves the
+    # opponent for a future game when the caller supplied BOTH teams' rows.
+    df["opp_id"] = df.opp_id.fillna(df.fut_opp)
 
     # opponent-adjusted, walk-forward pass/rush defense (features/defense_
     # profiles.py). Residual test showed raw allowed under-adjusts for D
@@ -533,8 +601,62 @@ def fit_volume_coefs(train: pd.DataFrame) -> dict:
     return out
 
 
+# ⚠️ REJECTED 2026-08-06, left "off". The BIAS IS REAL and season-stable — a
+# player returning from missed games is over-projected because the trailing
+# EWMA carries his stale pre-absence share (rush-share error at gap>=3: 2023
+# -0.0704, 2024 -0.0411, 2025 -0.0237; target share -0.0158/-0.0158/-0.0083).
+# Correcting it still made the BOOK WORSE: -11.6 u/szn (+87.0 -> +75.4), with
+# PROPS PRIME ROI falling 15.4% -> 10.9% on the same 120 bets/szn. Tested both
+# raw and normalised so only the RELATIVE staleness penalty applied (gap1
+# forced to 1.000, gap2 0.970, gap3 0.920) — identical result, so the
+# double-correction was not the cause.
+#
+# THE LESSON: a real bias in an input does not mean correcting it improves
+# betting. The recalibration and the market blend were fitted AROUND the
+# uncorrected projection; changing the input shifts the whole EV surface and
+# the selection with it. Judge a projection change by the BOOK, never by the
+# projection's own accuracy.
+GAP_MODE = "off"
+
+
+def fit_gap_mult(train: pd.DataFrame) -> dict:
+    """Share multiplier by weeks-since-last-appearance, fitted on `train`.
+
+    Bucket 1 = played last week, 2 = missed one, 3 = missed two or more.
+    Multiplier = mean(actual share) / mean(projected share) in that bucket, so
+    it corrects the LEVEL of a stale share without touching its ranking.
+    """
+    out = {}
+    for sh, num, team in (("rush_share", "rush_att", "team_rush_att"),
+                          ("tgt_share", "targets", "team_pass_att"),
+                          ("qb_share", "pass_att", "team_pass_att")):
+        t = train[train[team].gt(0) & train[num].notna()
+                  & train[f"trail_{sh}"].gt(0) & train.gap.notna()]
+        if len(t) < 200:
+            continue
+        b = np.where(t.gap <= 1, 1, np.where(t.gap == 2, 2, 3))
+        m = {}
+        for k in (1, 2, 3):
+            s = t[b == k]
+            if len(s) < 60:
+                m[k] = 1.0
+                continue
+            act = (s[num] / s[team]).mean()
+            prj = s[f"trail_{sh}"].mean()
+            m[k] = float(np.clip(act / prj, 0.6, 1.4)) if prj > 0 else 1.0
+        # NORMALISE so the "played last week" bucket is exactly 1.0. Only the
+        # RELATIVE staleness penalty is ours to apply — the overall level bias
+        # is already absorbed by the recalibration slope in props_vs_book, and
+        # correcting it twice measurably hurts (it cost -11.6 u/szn: PROPS
+        # PRIME ROI fell 15.4% -> 10.9% before this normalisation).
+        base = m.get(1, 1.0) or 1.0
+        out[sh] = {k: v / base for k, v in m.items()}
+    return out
+
+
 def project(df: pd.DataFrame, vol_coefs: dict | None = None,
-            write_coefs: bool = True) -> pd.DataFrame:
+            write_coefs: bool = True,
+            seasons: list[int] | None = None) -> pd.DataFrame:
     """Project every stat. `vol_coefs` overrides the fitted team-volume model
     so backtest/props_stability.py can resample it; `write_coefs=False` keeps
     an experiment from overwriting production model_coefs.json."""
@@ -557,7 +679,7 @@ def project(df: pd.DataFrame, vol_coefs: dict | None = None,
             "rush": [float(x) for x in vol_coefs["team_rush_att"]],
             "pass": [float(x) for x in vol_coefs["team_pass_att"]]})
 
-    d = df[df.season.isin(TEST_SEASONS)
+    d = df[df.season.isin(TEST_SEASONS if seasons is None else seasons)
            & df.week.between(1, 15)
            & ((df.prior_games >= MIN_PRIOR_GAMES) | (df.prior_w > 0))
            & df.team_spread.notna()].copy()
@@ -592,9 +714,25 @@ def project(df: pd.DataFrame, vol_coefs: dict | None = None,
         qb_f = _script_fwd(d.team_spread, script["qb"])
     else:
         rush_f = tgt_f = qb_f = 1.0
-    d["share_rush"] = d.trail_rush_share * rush_f
-    d["share_tgt"] = d.trail_tgt_share * tgt_f
-    d["share_qb"] = d.trail_qb_share * qb_f
+    # RETURN-FROM-ABSENCE adjustment, fitted on the TRAIN season only.
+    # A player back after missed games carries a stale share (see the `gap`
+    # note in build_table). The multiplier is mean(actual share)/mean(projected
+    # share) per gap bucket on `train`, so it is never fitted on the OOS years.
+    gap_m = fit_gap_mult(train) if GAP_MODE == "on" else {}
+    def _gm(col_share, col_num, col_team):
+        if not gap_m:
+            return 1.0
+        b = np.where(d.gap.isna(), 1, np.where(d.gap <= 1, 1,
+                     np.where(d.gap == 2, 2, 3)))
+        return pd.Series(b, index=d.index).map(
+            gap_m.get(col_share, {})).fillna(1.0).values
+
+    d["share_rush"] = d.trail_rush_share * rush_f * _gm(
+        "rush_share", "rush_att", "team_rush_att")
+    d["share_tgt"] = d.trail_tgt_share * tgt_f * _gm(
+        "tgt_share", "targets", "team_pass_att")
+    d["share_qb"] = d.trail_qb_share * qb_f * _gm(
+        "qb_share", "pass_att", "team_pass_att")
 
     d["proj_rush_yds"] = (d.share_rush * d.exp_team_rush_att
                           * blend(d.trail_ypc, d.cum_rush_att, lg["ypc"], 40)
@@ -608,7 +746,69 @@ def project(df: pd.DataFrame, vol_coefs: dict | None = None,
     d["proj_pass_yds"] = (d.share_qb * d.exp_team_pass_att
                           * blend(d.trail_ypa, d.cum_pass_att, lg["ypa"], 80)
                           * opp_pass.fillna(1))
+
+    # VOLUME projections. Yards = attempts x efficiency, and efficiency is the
+    # noisy factor we bolt on — so we predict ATTEMPTS strictly better than the
+    # yards derived from them (2024-25: rush att corr 0.541 vs 0.448 for rush
+    # yards; pass att 0.454 vs 0.358). These are the numbers behind every
+    # yardage projection above; they were simply never exposed as columns.
+    #
+    # Traditional US books rarely post NCAAF attempts/completions and The Odds
+    # API's historical archive has none, so these CANNOT be backtested the way
+    # the yardage markets were. DFS pick'em books do post them (typically near
+    # the median at ~even money, e.g. "23.5 completions"). Treat as PAPER until
+    # forward-graded — `player_game_logs` now carries the actuals to grade with.
+    d["proj_rush_att"] = d.share_rush * d.exp_team_rush_att
+    d["proj_pass_att"] = d.share_qb * d.exp_team_pass_att
+    comp_rate = (d.trail_pass_comp / d.trail_pass_att.replace(0, np.nan))
+    lg_comp = float((train.pass_comp.sum() / train.pass_att.sum())
+                    if train.pass_att.sum() else 0.62)
+    d["proj_pass_comp"] = d.proj_pass_att * blend(
+        comp_rate, d.cum_pass_att, lg_comp, 80).clip(0.30, 0.85)
     return d
+
+
+def project_upcoming(games: pd.DataFrame,
+                     vol_coefs: dict | None = None) -> pd.DataFrame:
+    """Project every stat for games that have NOT been played yet.
+
+    THE live entry point. It runs the identical pipeline the backtests
+    measure — `build_table` for trailing form and the opponent factor, then
+    `project` for the volume model and the yardage blends — so a backtested
+    ROI is a claim about the model that actually prices the board.
+
+    `games`: one row per TEAM (so two per game) with
+        season, week, game_id, team_id, opp_id, team_spread
+    where `team_spread` is positive when THIS team is the underdog.
+
+    The roster for each team is the union of players who have logged a game
+    for it this season and players carrying a season-opening prior. In week 1
+    only the second set exists, which is precisely the old behaviour.
+    """
+    logs = pd.read_parquet(PARQUET_DIR / "player_game_logs.parquet")
+    priors = player_priors(logs)
+
+    rows = []
+    for g in games.itertuples():
+        played = logs[(logs.season == g.season) & (logs.team_id == g.team_id)]
+        pri = priors[(priors.season == g.season) & (priors.team_id == g.team_id)]
+        names = sorted(set(played.player.unique()) | set(pri.player.unique()))
+        for p in names:
+            rows.append({
+                "season": int(g.season), "week": float(g.week),
+                "game_id": float(g.game_id), "team_id": int(g.team_id),
+                "player": p, "team_spread": float(g.team_spread),
+                "opp_id": float(g.opp_id),
+            })
+    if not rows:
+        return pd.DataFrame()
+
+    future = pd.DataFrame(rows)
+    table = build_table(future=future)
+    live = int(games.season.iloc[0])
+    out = project(table, vol_coefs=vol_coefs, write_coefs=False,
+                  seasons=sorted(set(TEST_SEASONS) | {live}))
+    return out[out._future].copy()
 
 
 def report(d: pd.DataFrame) -> None:

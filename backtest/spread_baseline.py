@@ -10,7 +10,8 @@ were already walked through (no lookahead).
 import numpy as np
 import pandas as pd
 
-from features.epa_ratings import SEASON_STRIDE, fit_ratings, load_game_obs
+from features.epa_ratings import (POSTSEASON, SEASON_STRIDE, fit_ratings,
+                                  load_game_obs)
 from ingestion.config import CFBD_PARQUET_DIR, PARQUET_DIR
 
 TRAIN_SEASONS = [2023, 2024, 2025]
@@ -32,21 +33,58 @@ def consensus_lines(season: int) -> pd.DataFrame:
 
 
 def game_table(obs: pd.DataFrame) -> pd.DataFrame:
-    """One row per game with home/away ids and final margin."""
-    g = obs.groupby("game_id", as_index=False).agg(
-        season=("season", "first"), week=("week", "first"),
-        season_type=("seasonType", "first"),
-        home_id=("home_id", "first"),
-        home_score=("home_score", "first"), away_score=("away_score", "first"))
-    ids = obs.groupby("game_id").off_id.unique()
-    g["away_id"] = [
-        next((t for t in ids[gid] if t != h), None)
-        for gid, h in zip(g.game_id, g.home_id)
-    ]
-    # NOTE: home_score/away_score here come from garbage-time-filtered plays
-    # (truncated in blowouts) — never grade bets against them. Official final
-    # margins are merged from the CFBD games table in run().
-    return g.dropna(subset=["away_id"])
+    """One row per game, built from the CFBD GAMES TABLE — never from plays.
+
+    ⚠️ This function used to derive the universe from `obs`: it took `away_id`
+    from the offenses appearing in surviving plays and dropped games where that
+    came back empty. `obs` is garbage-time-filtered
+    (`wp_before.between(0.04, 0.96)`), so in a wire-to-wire blowout EVERY play
+    is filtered and the whole game DISAPPEARED. Sample membership was therefore
+    conditioned on the OUTCOME — the single worst thing that can happen to a
+    backtest.
+
+    Measured damage (FBS-v-FBS 2023-25): coverage fell from 71% at small
+    spreads to 56.6% at |spread|>=25, and the games it deleted were the ones
+    where the dog was buried (mean final -40.5 vs -27.9 for those it kept).
+    That manufactured the entire "the dog's Q1 deficit plateaus near 4 points"
+    mechanism: flat at -3.8/-4.1 inside the sample, but -3.4 -> -10.2 across
+    the real universe. The Q1 big-dog play went +42.6% ROI (t=5.44) in-sample
+    to +8.6% (t=1.17, CI [-5.4,+22.4]) on the truth.
+
+    Plays still decide RATINGS — filtering garbage time there is correct and
+    unchanged. They must never decide which games exist.
+
+    `home_id`/`away_id` are mapped into the ratings model's own vocabulary:
+    anything the ratings never saw as a distinct team is pooled to FCS_ID,
+    matching `load_game_obs`. That is a season-level property, not a
+    game-level one, so it cannot select on a result.
+    """
+    from features.epa_ratings import FCS_ID
+
+    fbs = set(pd.unique(obs.off_id)) - {FCS_ID}
+    frames = []
+    for season in sorted(obs.season.unique()):
+        g = pd.read_parquet(CFBD_PARQUET_DIR / f"games_{int(season)}.parquet")
+        g = g[g.homeId.notna() & g.awayId.notna()].copy()
+        frames.append(pd.DataFrame({
+            "game_id": g.id.astype("int64"),
+            "season": int(season),
+            "week": g.week.astype("int64"),
+            # CFBD games store seasonType as text; obs/downstream use the
+            # numeric code (2 = regular, 3 = postseason).
+            "season_type": np.where(g.seasonType.astype(str) == "postseason",
+                                    POSTSEASON, 2),
+            "home_id": g.homeId.astype("int64"),
+            "away_id": g.awayId.astype("int64"),
+            # Official finals, straight from CFBD — not the truncated
+            # play-derived scores the old version carried.
+            "home_score": g.homePoints,
+            "away_score": g.awayPoints,
+        }))
+    out = pd.concat(frames, ignore_index=True)
+    for c in ("home_id", "away_id"):
+        out[c] = out[c].where(out[c].isin(fbs), FCS_ID)
+    return out
 
 
 def run() -> pd.DataFrame:

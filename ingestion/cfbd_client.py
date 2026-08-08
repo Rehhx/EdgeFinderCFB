@@ -31,11 +31,25 @@ class CFBDClient:
         return CFBD_RAW_DIR / f"{safe}_{key}.json"
 
     def get(self, endpoint: str, params: dict | None = None, refresh: bool = False):
-        """GET an endpoint, serving from disk cache unless refresh=True."""
+        """GET an endpoint, serving from disk cache unless refresh=True.
+
+        An EMPTY cached payload is treated as a cache MISS, not as an answer.
+        CFBD returns `[]` for a season whose data it has not published yet, and
+        caching that permanently freezes the caller at whatever degraded
+        fallback it has — silently, because the fallback is designed to be
+        quiet. On 2026-08-05 both `/roster` and `/player/returning` for 2026
+        held cached `[]`, so `scripts/august_refit.py` would have logged "not
+        published yet" every Monday of the season without ever re-asking, and
+        preseason priors would have run on league-median returning production
+        all year. Re-fetching empties costs ~1 call each per run against a
+        1,000/month quota (peak use so far: 251).
+        """
         params = params or {}
         cache = self._cache_path(endpoint, params)
         if cache.exists() and not refresh:
-            return json.loads(cache.read_text(encoding="utf-8"))["data"]
+            cached = json.loads(cache.read_text(encoding="utf-8"))["data"]
+            if cached:
+                return cached
 
         resp = self.session.get(
             f"{CFBD_BASE_URL}{endpoint}", params=params, timeout=60

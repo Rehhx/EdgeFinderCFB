@@ -26,9 +26,16 @@ EXCLUDE_STATS = ("rec_yds",)
 
 def q1_bets() -> pd.DataFrame:
     d = pd.read_parquet(PARQUET_DIR / "backtest_q1_spreads.parquet")
-    d = d[d.covered.notna() & (d.n_books >= 2) & (d.dog_full_line >= 17)].copy()
-    d["play"] = np.where(d.dog_full_line >= 25, "Q1 PREMIUM", "Q1 STANDARD")
-    d["units"] = np.where(d.dog_full_line >= 25, 2.0, 1.0)
+    # Q1 PREMIUM (|spread| >= 25) DROPPED 2026-08-06. On the de-contaminated
+    # sample it is the only Q1 slice that fails outright: 56.0% / +8.0% pooled
+    # but bootstrap CI [-7.3, +23.8] and 2025 NEGATIVE, and it graded -0.7
+    # u/szn in the complete-book seasons while consuming 49 bets/szn at 2u.
+    # Excluded HERE, before dedupe(), so those >=25 games flow to BIG-DOG 1H
+    # instead of disappearing from the book.
+    d = d[d.covered.notna() & (d.n_books >= 2)
+          & d.dog_full_line.between(17, 25, inclusive="left")].copy()
+    d["play"] = "Q1 STANDARD"
+    d["units"] = 1.0
     d["pnl"] = d.pnl_med
     return d[["season", "week", "game_id", "play", "units", "pnl",
               "dog_full_line"]]
@@ -40,7 +47,9 @@ def h1_bets() -> pd.DataFrame:
     keep = (((d.dog_full_line >= 17) & d.week.between(1, 5))
             | ((d.dog_full_line >= 21) & (d.week >= 6)))
     d = d[keep].copy()
-    d["play"], d["units"], d["pnl"] = "BIG-DOG 1H", 2.0, d.pnl_med
+    # mirror picks/first_half_picks.BIGDOG_UNITS
+    from picks.first_half_picks import BIGDOG_UNITS
+    d["play"], d["units"], d["pnl"] = "BIG-DOG 1H", BIGDOG_UNITS, d.pnl_med
     return d[["season", "week", "game_id", "play", "units", "pnl",
               "dog_full_line"]]
 
@@ -51,10 +60,29 @@ def spread_bets() -> pd.DataFrame:
     d = d[d.season.isin(SEASONS) & d.week.between(1, 5) & d.won.notna()].copy()
     d["dog_full_line"] = d.book_spread.abs()
     d["model_on_dog"] = np.where(d.book_spread > 0, d.edge, -d.edge)
-    d = d[(d.dog_full_line >= 17) & (d.model_on_dog >= 6)].copy()
-    d["play"] = np.where(d.dog_full_line >= 25, "SPREAD PREMIUM",
-                         "SPREAD STANDARD")
-    d["units"] = np.where(d.dog_full_line >= 25, 2.0, 1.0)
+    # SPREAD PREMIUM (|spread| >= 25) REMOVED 2026-08-06 after a 22-variant
+    # rescue attempt on 8 clean seasons in which NOTHING cleared the bar
+    # (positive every season AND bootstrap CI excluding zero):
+    #   shipped dog edge>=6   48.6%  -7.0%  t=-1.81  2/8
+    #   blind dog, no model   49.9%  -4.6%          3/8   <- blind BEATS us
+    #   fade the favourite    51.4%  -1.9%          4/8   <- still under 52.4% BE
+    #   all weeks 1-15        47.4%  -9.3%  t=-2.87 2/8   <- significantly NEGATIVE
+    # and raising the edge threshold made it WORSE (>=12 -> -10.5%): on
+    # |spread|>=25 the bulk of the sample (dog_edge>=12, n=477) covers 46.8%
+    # while low-edge games sit near 53%. The model's confidence is
+    # anti-predictive here, so there is no threshold to tune. One slice looked
+    # good (HOME dogs 65.1%, +24.3%) on n=43 with a CI spanning zero — that is
+    # the 1-in-22 you expect to find by looking 22 times.
+    d = d[(d.dog_full_line >= 17) & (d.dog_full_line < 25)
+          & (d.model_on_dog >= 6)].copy()
+    d["play"] = "SPREAD STANDARD"
+    # Flat 1u, matching picks/ml_spread_picks.py. The PREMIUM tier was staked
+    # at 2u on the strength of a 62.3% / +18.8% / 8-of-8 claim measured on the
+    # contaminated sample; on the clean universe it is NEGATIVE in every
+    # specification tested (ML 48.9%/-6.5%, linear control 47.5%/-9.1%), so
+    # doubling it doubled a loss. The sim must stake what the pick modules
+    # stake, or the bankroll forecast describes a book nobody is betting.
+    d["units"] = 1.0
     d["pnl"] = np.where(d.won == 1, 100 / 110, -1.0)
     d["game_id"] = d.game_id.astype("int64")
     return d[["season", "week", "game_id", "play", "units", "pnl",
@@ -80,7 +108,13 @@ def prop_bets() -> pd.DataFrame:
     prime = d.bet_ev_bl.between(0.05, 0.08, inclusive="left")
     d["play"] = np.where(probe, "PROPS PROBE",
                          np.where(prime, "PROPS PRIME", "PROPS STANDARD"))
-    d["units"] = np.where(probe, 1.0, np.where(prime, 2.0, 1.0))
+    # Mirror picks/prop_picks.py::STAT_STAKE_MULT — the sim must stake what the
+    # pick modules stake or the forecast describes a book nobody is betting.
+    from picks.prop_picks import STAT_STAKE_MULT
+    from picks.prop_picks import (PRIME_UNITS, PROBE_UNITS, STANDARD_UNITS)
+    d["units"] = (np.where(probe, PROBE_UNITS,
+                           np.where(prime, PRIME_UNITS, STANDARD_UNITS))
+                  * d.stat.map(STAT_STAKE_MULT).fillna(1.0).values)
     d["pnl"] = d.pnl_bl
     d["game_id"] = -1                             # props don't share the dog
     d["dog_full_line"] = np.nan
@@ -107,7 +141,14 @@ TEASE_PTS, TEASER_PRICE = 10.0, -180.0
 # teaser), and the week-block bootstrap prices that correlation in because both
 # outcomes sit in the same resampled week. It still wins, because an 83.8%
 # bet added to the book lifts the median AND the 5th percentile.
-TEASER_MODE = "add"
+# ⚠️ SET TO "off" 2026-08-06. The reasoning below was measured on the
+# contaminated sample where the teaser leg hit 91.5% (quoted as "83.8%", which
+# was actually the JOINT rate). On the clean sample the leg is 83.6% and the
+# JOINT is 69.9% -> EV +8.8% at -180, and in the two complete-book seasons the
+# realised contribution is **-0.0 u/szn** (2024 +2.9, 2025 -2.9). It also
+# stacks correlated exposure on games we already bet as 1H singles. Research
+# retained in backtest/teasers.py; not in the book.
+TEASER_MODE = "off"
 # Modelled optimum is higher — return rises and P(loss) FALLS monotonically to
 # at least 3u (+124.6 u/szn, median $2,024, P(loss) 1.4%). Shipped at 1u
 # anyway, on the same principle as the PROPS PROBE tier: this is a new play on
@@ -160,12 +201,11 @@ def dedupe(book: pd.DataFrame) -> pd.DataFrame:
     """
     derived = book[book.game_id > 0].copy()
     props = book[book.game_id < 0]
-    order = {"Q1 PREMIUM": 0, "BIG-DOG 1H": 1, "Q1 STANDARD": 2,
-             "SPREAD PREMIUM": 3, "SPREAD STANDARD": 4}
-    # >=25 prefers Q1; 21-25 prefers 1H (h2h: +44.0 vs +26.7, +23.1 vs +11.4)
+    # Q1 PREMIUM and SPREAD PREMIUM are gone (see build_book / q1_bets), so
+    # |spread| >= 25 now flows to BIG-DOG 1H, which is the best surviving
+    # derived play (3/3 seasons positive, model filter helps).
+    order = {"BIG-DOG 1H": 0, "Q1 STANDARD": 1, "SPREAD STANDARD": 2}
     derived["rank"] = derived.play.map(order)
-    mid = derived.dog_full_line.between(21, 25, inclusive="left")
-    derived.loc[mid & (derived.play == "BIG-DOG 1H"), "rank"] = -1
     derived = derived.sort_values("rank").drop_duplicates(
         subset=["season", "game_id"], keep="first")
     return pd.concat([derived.drop(columns="rank"), props], ignore_index=True)
@@ -218,7 +258,14 @@ Q1_MAX_STAKE = 50.0
 # Requiring bets to clear EV>=5% across the whole w band was tested and does
 # NOT fix it — the intersection is just the most conservative w, and that book
 # is +0.4 u/szn. So the exposure is real and is priced in here instead.
-PROPS_EXTRA_HAIRCUT = 0.20
+# ⚠️ LOWERED 0.20 -> 0.00 on 2026-08-06. The extra penalty was set when props
+# were judged "measurably less certain" than the derived-line plays. The audit
+# INVERTED that: props are the only play positive in both OOS seasons with all
+# controls passed, while every derived play now sits inside its own confidence
+# interval (see HANDOFF §10). Penalising the best-evidenced play 20pp harder
+# than the unproven ones had the ranking backwards.
+# NOTE this changes what we EXPECT, not what we bet — no selection changes.
+PROPS_EXTRA_HAIRCUT = 0.00
 
 
 def _blocks(book: pd.DataFrame, unit: float, haircut: float):
@@ -226,8 +273,8 @@ def _blocks(book: pd.DataFrame, unit: float, haircut: float):
 
     haircut shifts each outcome down by h * (that play's mean ROI), which cuts
     the edge while preserving the variance — the right way to ask "what if the
-    true edge is smaller than the backtest measured?" Props take an extra
-    PROPS_EXTRA_HAIRCUT because their edge is measurably less certain.
+    true edge is smaller than the backtest measured?" PROPS_EXTRA_HAIRCUT is
+    now 0: props are the best-evidenced play in the book, not the weakest.
     """
     b = book.copy()
     roi = b.groupby("play").pnl.transform("mean")
@@ -237,15 +284,50 @@ def _blocks(book: pd.DataFrame, unit: float, haircut: float):
     b["stake"] = b.units * unit
     is_q1 = b.play.str.startswith("Q1")
     b.loc[is_q1, "stake"] = b.loc[is_q1, "stake"].clip(upper=Q1_MAX_STAKE)
+    b = b[b.season.isin(full_book_seasons(book))]
     return [g[["stake", "pnl_adj"]].values
             for _, g in b.groupby(["season", "week"])]
+
+
+def full_book_seasons(book: pd.DataFrame) -> list[int]:
+    """Seasons in which EVERY play was actually priced.
+
+    The bootstrap resamples (season, week) blocks from a pooled set, so a
+    simulated season inherits the average play mix of the pool — not the mix
+    of a real season. Props were only bet out-of-sample in 2024-25 (2023 is
+    their calibration season), so pooling all three gave a simulated season
+    just 2/3 of a real season's props:
+
+        play              actual u/szn   simulated   ratio
+        PROPS PRIME             +37.4       +25.5     68%
+        PROPS PROBE              +8.4        +5.7     68%
+        PROPS STANDARD          +11.1        +7.6     68%
+        everything else            --          --    102%
+        TOTAL                   +72.6       +54.9     76%
+
+    So `main()` printed a +72.6 u/szn book while the bankroll distribution
+    underneath it was drawn from a +54.9 one — a 24% disagreement, on what is
+    now the play carrying the book.
+
+    Computed rather than hard-coded so it self-corrects as seasons are added:
+    a season counts only if every play in the book appears in it.
+    """
+    plays = set(book.play.unique())
+    ok = [int(s) for s, g in book.groupby("season")
+          if set(g.play.unique()) == plays]
+    if not ok:                      # no season has the complete book
+        print("  [!] no season contains every play — bootstrapping the full "
+              "pool; per-play volumes will not match the table above")
+        return sorted(book.season.unique().tolist())
+    return ok
 
 
 def simulate(book: pd.DataFrame, unit_pct: float, rng,
              haircut: float = 0.0) -> np.ndarray:
     """Block bootstrap: resample WEEKS with replacement, keeping bets together."""
     blocks = _blocks(book, BANKROLL * unit_pct, haircut)
-    n_weeks = int(round(len(blocks) / len(SEASONS)))
+    # divide by the seasons the blocks actually came from, not every season
+    n_weeks = int(round(len(blocks) / len(full_book_seasons(book))))
     out = np.empty(N_SIMS)
     for i in range(N_SIMS):
         idx = rng.integers(0, len(blocks), n_weeks)
@@ -257,7 +339,8 @@ def simulate(book: pd.DataFrame, unit_pct: float, rng,
 def drawdown(book: pd.DataFrame, unit_pct: float, rng, haircut: float = 0.0,
              n=2000) -> np.ndarray:
     blocks = _blocks(book, BANKROLL * unit_pct, haircut)
-    n_weeks = int(round(len(blocks) / len(SEASONS)))
+    # divide by the seasons the blocks actually came from, not every season
+    n_weeks = int(round(len(blocks) / len(full_book_seasons(book))))
     worst = np.empty(n)
     for i in range(n):
         idx = rng.integers(0, len(blocks), n_weeks)
@@ -270,16 +353,34 @@ def drawdown(book: pd.DataFrame, unit_pct: float, rng, haircut: float = 0.0,
 
 
 def main() -> None:
-    book = build_book()
-    print("\n=== the season book, per play (real backtested outcomes) ===")
+    full = build_book()
+
+    # The per-season view FIRST, because it is the most decision-relevant fact
+    # in this file: every derived-line play peaks in 2023 and decays, while
+    # props are the only stable one.
+    full["_u"] = full.units * full.pnl
+    print("\n=== units by play and SEASON (is the edge decaying?) ===")
+    piv = full.pivot_table(index="play", columns="season", values="_u",
+                           aggfunc="sum").round(1)
+    print(piv.to_string())
+    print("season totals:",
+          {int(k): round(v, 1) for k, v in full.groupby("season")._u.sum().items()})
+
+    # Table and simulation MUST describe the same population. The bootstrap
+    # resamples (season, week) blocks, so it can only reproduce a real season's
+    # play mix using seasons where every play was priced — props were bet
+    # out-of-sample only in 2024-25. Reporting per-play means over 3 seasons
+    # while simulating from a 2-season-props pool is what made the printed
+    # book (+72.6 u) disagree with the simulated one (+54.9 u) by 24%.
+    fs = full_book_seasons(full)
+    book = full[full.season.isin(fs)]
+    print(f"\n=== the season book, per play "
+          f"(seasons with the COMPLETE book: {fs}) ===")
     g = book.groupby("play").agg(
         bets=("pnl", "size"), units=("units", "mean"),
         roi=("pnl", "mean"), won=("pnl", lambda s: (s > 0).mean()))
-    g["bets_per_szn"] = (g.bets / np.where(g.index.str.startswith("PROPS"),
-                                           2, 3)).round(0)
-    g["u_per_szn"] = [
-        (book[book.play == p].units * book[book.play == p].pnl).sum()
-        / (2 if p.startswith("PROPS") else 3) for p in g.index]
+    g["bets_per_szn"] = (g.bets / len(fs)).round(0)
+    g["u_per_szn"] = [book[book.play == p]._u.sum() / len(fs) for p in g.index]
     print(g.round(3).to_string())
     total_u = g.u_per_szn.sum()
     total_b = g.bets_per_szn.sum()

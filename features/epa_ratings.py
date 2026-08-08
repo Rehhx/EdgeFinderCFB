@@ -17,6 +17,8 @@ from ingestion.config import PBP_DIR
 # this creates is deliberate — it decays last season's evidence for roster churn.
 SEASON_STRIDE = 30
 FCS_ID = -1  # all non-FBS opponents pooled into one pseudo-team
+POSTSEASON = 3       # CFBD seasonType code; regular season is 2
+POSTSEASON_WEEK = 20  # sorts bowls after week 16, still inside the stride
 
 PBP_COLS = [
     "game_id", "season", "seasonType", "week", "pos_team", "def_pos_team",
@@ -68,8 +70,38 @@ def load_game_obs(seasons: list[int]) -> pd.DataFrame:
         frames.append(obs)
 
     out = pd.concat(frames, ignore_index=True)
-    out["week_idx"] = out.season * SEASON_STRIDE + out.week
+    # CFBD labels every POSTSEASON game `week=1` (verified: 2024 has 48 such
+    # games, all week 1). A naive season*STRIDE + week therefore sorts a
+    # season's bowls BEFORE its own week 2, and `fit_ratings` filters on
+    # `week_idx < asof` — so December bowls were the most heavily recency-
+    # weighted observations in every early-season fit (19-22% of week-2 fit
+    # weight). Postseason must sort after the regular season.
+    post = out.seasonType == POSTSEASON
+    out["week_idx"] = out.season * SEASON_STRIDE + np.where(
+        post, POSTSEASON_WEEK, out.week)
     return out
+
+
+def asof_seasons(base: list[int], season: int) -> list[int]:
+    """`base` plus the live season, once its play-by-play has actually landed.
+
+    Live pick modules hard-coded a season range ending the PRIOR year, so they
+    could not have used current-season form even if they asked for it.
+    """
+    if season in base or not (PBP_DIR / f"play_by_play_{season}.parquet").exists():
+        return list(base)
+    return list(base) + [season]
+
+
+def live_asof(season: int, week: int | None) -> int:
+    """Week index to fit ratings AS OF for a live pick.
+
+    The live modules passed `season * SEASON_STRIDE + 1` — frozen at preseason
+    all year — while every backtest refits weekly (corr between the two is only
+    0.80, and 0.72 in weeks 6-15). `fit_ratings` filters strictly
+    `week_idx < asof`, so week W sees everything before W and nothing from it.
+    """
+    return season * SEASON_STRIDE + max(int(week or 1), 1)
 
 
 @dataclass

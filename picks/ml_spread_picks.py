@@ -3,7 +3,13 @@
 Trains the gradient-boosted margin model on all early-season history, then
 prices the live board's weeks 1-5 games. Logged to the paper tracker as
 market 'ml_spread' so we compare it head-to-head with the linear 'spread'
-picks all season. Backtest: +6.3% ROI vs linear +5.3% (2023-25, wks 1-5).
+picks.
+
+⚠️ PAPER ONLY. The old header claimed "+6.3% ROI vs linear +5.3%"; on the
+de-contaminated game universe both models are BELOW break-even at the generic
+cut — ML 50.5% / -3.6%, linear 51.4% / -1.9% (break-even 52.4%). The tiered
+big-dog selection is no better: see the TIERS note below, where the tier
+ordering inverts depending on which model and window you ask.
 
   python -m picks.ml_spread_picks
 """
@@ -20,12 +26,31 @@ from models.ml_spread import (FEATS, PBP_SEASONS, feature_row, load_priors,
 from picks.edge_report import team_matcher
 
 SEASON = 2026
-# validated edge (8 seasons): dog side, big spread, strong disagreement
 EDGE_FLAG = 6.0
 MIN_ABS_SPREAD = 17.0
-PREMIUM_SPREAD = 25.0   # 62.3% / +18.8% ROI vs 59.2% / +13.0% at 17+
-# 8-season tier stats (wks 1-5, dog side, edge>=6), for sizing
-TIERS = {"PREMIUM": (0.623, 302, 18.8), "STANDARD": (0.569, 259, 8.6)}
+PREMIUM_SPREAD = 25.0
+MAX_WEEK = 5            # this play was ONLY ever fitted on weeks 1-5
+
+# ⚠️ RE-MEASURED 2026-08-05 on the de-contaminated game universe (the
+# garbage-time play filter used to delete blowouts from the sample entirely —
+# see backtest/spread_baseline.py::game_table). The old numbers below were
+# measured on that poisoned sample and were badly wrong:
+#
+#   tier                claimed          ML (clean)              linear control
+#   PREMIUM >=25   62.3% / +18.8% / 8-8   48.9% / -6.5% / 1-3    47.5% / -9.1% / 0-3
+#   STANDARD 17-25 56.9% /  +8.6%         58.7% / +11.8% / 3-3   58.9% / +12.3% / 3-3
+#
+# THE TIER ORDER INVERTED: the slice we staked at 2u is the one that loses, in
+# BOTH the ML model and the linear control. PREMIUM is cut to 1u — that is
+# removing an unjustified size multiplier from a tier now measured negative,
+# not fitting a new threshold.
+#
+# ⚠️ AND DO NOT TRUST EITHER TIER. On an 8-season EPA re-derivation the signs
+# flip the OTHER way (PREMIUM +2.3% 5-of-8, STANDARD -11.9% 1-of-8, t=-2.56).
+# Whichever tier looks good depends on the model, window and edge definition
+# you happen to ask — which is what "the tier structure is noise" means. This
+# module stays a PAPER trial until a deliberate re-derivation says otherwise.
+TIERS = {"PREMIUM": (0.489, 191, -6.5), "STANDARD": (0.587, 141, 11.8)}
 
 
 def validated_plays(df: pd.DataFrame) -> pd.DataFrame:
@@ -40,23 +65,50 @@ def validated_plays(df: pd.DataFrame) -> pd.DataFrame:
     """
     if df.empty:
         return df
+    # WEEK GATE. The model trains on weeks 1-5 only and every stat quoted for
+    # this play is a weeks-1-5 stat, but nothing enforced it — the docstring,
+    # the report header and `paper_trades import-ml-spread` all said
+    # "weeks 1-5 only" while the code emitted plays for all 15 weeks.
+    # PER-GAME week gate. This used to gate the whole board on current_week(),
+    # which is "what week is it now" — the right input for the ratings as-of
+    # fit, the wrong one for deciding whether a FIXTURE is in the window. The
+    # live board spans several weeks at once (today: weeks 1-5), so the old
+    # form would admit a week-6 game while current_week()==5 and suppress a
+    # still-listed week-5 game once the calendar reached week 6.
+    from picks.prop_picks import game_week
+    gw = df.commence.map(lambda c: game_week(c))
+    in_window = gw.isna() | (gw <= MAX_WEEK)   # unknown week -> do not drop
+    df = df[in_window]
+    if df.empty:
+        return df.assign(tier="STANDARD", units=1.0)
+
     fav_is_home = df.book_spread < 0
     picks_home = df.edge > 0
     picks_dog = picks_home != fav_is_home
     keep = (picks_dog & (df.book_spread.abs() >= MIN_ABS_SPREAD)
+            # PREMIUM (|spread| >= PREMIUM_SPREAD) is EXCLUDED — see the note
+            # on TIERS. 22 variants were tested on 8 clean seasons and none
+            # cleared the bar; blind beat model-selected, and raising the edge
+            # threshold made it worse, so the selection is anti-predictive.
+            & (df.book_spread.abs() < PREMIUM_SPREAD)
             & (df.edge.abs() >= EDGE_FLAG))
     out = df[keep].copy()
-    out["tier"] = np.where(out.book_spread.abs() >= PREMIUM_SPREAD,
-                           "PREMIUM", "STANDARD")
-    out["units"] = np.where(out.tier == "PREMIUM", 2.0, 1.0)
+    out["tier"] = "STANDARD"
+    # Flat 1u across tiers: PREMIUM measures NEGATIVE on clean data in both
+    # the ML model and the linear control (see the TIERS note above).
+    out["units"] = 1.0
     return out.sort_values(["tier", "edge"], key=lambda c: (
         c if c.name != "edge" else c.abs()), ascending=[True, False])
 
 
 def run() -> pd.DataFrame:
-    obs = load_game_obs(PBP_SEASONS)
+    # Refit AS OF the upcoming week, including the live season once its
+    # play-by-play lands (features/epa_ratings.live_asof).
+    from features.epa_ratings import asof_seasons, live_asof
+    from picks.prop_picks import current_week
+    obs = load_game_obs(asof_seasons(PBP_SEASONS, SEASON))
     model = train_live_model()
-    ratings = fit_ratings(obs, asof_week_idx=SEASON * SEASON_STRIDE + 1)
+    ratings = fit_ratings(obs, asof_week_idx=live_asof(SEASON, current_week()))
     pr = load_priors(SEASON, obs)
     match = team_matcher()
 
@@ -84,7 +136,11 @@ def run() -> pd.DataFrame:
                      "fair_spread": round(-pred, 1), "book_spread": book,
                      "edge": round(pred - (-book), 1)})
     df = pd.DataFrame(rows)
-    print(f"ML-spread priced: {len(df)} games | credits {client.remaining()}")
+    # Carry the week so validated_plays() gates on the SAME value the ratings
+    # were fitted as-of, rather than re-deriving it independently.
+    df.attrs["week"] = current_week() or 1
+    print(f"ML-spread priced: {len(df)} games (week {df.attrs['week']}) "
+          f"| credits {client.remaining()}")
     return df
 
 

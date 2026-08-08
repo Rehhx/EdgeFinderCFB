@@ -19,12 +19,15 @@ COLS = [
     "game_id", "season", "week", "pos_team", "pass", "rush", "sack",
     "completion", "yds_rushed", "yds_receiving", "statYardage",
     "rusher_player_name", "receiver_player_name", "passer_player_name",
+    # touchdowns: needed to grade/project the pass-TD and anytime-TD prop
+    # markets. Present in the PBP all along; we simply never extracted them.
+    "rush_td", "pass_td",
 ]
 
 
 def load_season(season: int) -> pd.DataFrame:
     df = pd.read_parquet(PBP_DIR / f"play_by_play_{season}.parquet", columns=COLS)
-    for c in ("pass", "rush", "sack", "completion"):
+    for c in ("pass", "rush", "sack", "completion", "rush_td", "pass_td"):
         df[c] = df[c].fillna(False).astype(bool)
     df = df[df.pos_team.notna()]
     df["pos_team"] = df.pos_team.astype(int)
@@ -45,25 +48,29 @@ def season_logs(season: int) -> pd.DataFrame:
 
     rush = df[df.rush & df.rusher_player_name.notna()]
     rush_g = rush.groupby(key + ["rusher_player_name"]).agg(
-        rush_att=("rush", "size"), rush_yds=("yds_rushed", "sum")
+        rush_att=("rush", "size"), rush_yds=("yds_rushed", "sum"),
+        rush_td=("rush_td", "sum")
     ).reset_index().rename(columns={"rusher_player_name": "player"})
 
     tgt = df[df["pass"] & ~df.sack & df.receiver_player_name.notna()]
     tgt_g = tgt.groupby(key + ["receiver_player_name"]).agg(
         targets=("pass", "size"), receptions=("completion", "sum"),
         rec_yds=("yds_receiving", lambda y: y.fillna(0).sum()),
+        rec_td=("pass_td", "sum"),
     ).reset_index().rename(columns={"receiver_player_name": "player"})
 
     pas = df[df["pass"] & ~df.sack & df.passer_player_name.notna()]
     pas_g = pas.groupby(key + ["passer_player_name"]).agg(
         pass_att=("pass", "size"), pass_comp=("completion", "sum"),
         pass_yds=("yds_receiving", lambda y: y.fillna(0).sum()),
+        pass_td=("pass_td", "sum"),
     ).reset_index().rename(columns={"passer_player_name": "player"})
 
     out = rush_g.merge(tgt_g, on=key + ["player"], how="outer") \
                 .merge(pas_g, on=key + ["player"], how="outer")
-    stat_cols = ["rush_att", "rush_yds", "targets", "receptions", "rec_yds",
-                 "pass_att", "pass_comp", "pass_yds"]
+    stat_cols = ["rush_att", "rush_yds", "rush_td", "targets", "receptions",
+                 "rec_yds", "rec_td", "pass_att", "pass_comp", "pass_yds",
+                 "pass_td"]
     out[stat_cols] = out[stat_cols].fillna(0)
     return out.rename(columns={"pos_team": "team_id"})
 

@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 import numpy as np
 import pandas as pd
 
-from features.epa_ratings import SEASON_STRIDE, fit_ratings
+from features.epa_ratings import POSTSEASON_WEEK, SEASON_STRIDE, fit_ratings
 from features.first_half import load_1h_obs
 from ingestion.config import PARQUET_DIR, PROJECT_ROOT, load_coefs
 from ingestion.odds_client import NCAAF, OddsClient
@@ -48,7 +48,25 @@ TIER, UNITS = "STANDARD", 1.0
 # so it is the COMBINATION that wins. Mechanism: in these spots the dog
 # covers ~3.6 pts in the 1H but only ~0.9 in the 2H, while books set the 1H
 # line at a flat 56.8% of the full spread — a derived-line shortcut.
-BIGDOG_TIER, BIGDOG_UNITS = "BIG-DOG 1H", 2.0
+# STAKE FOLLOWS EVIDENCE (re-derived 2026-08-06). Measured on the
+# complete-book seasons, the old assignment was INVERTED: BIG-DOG 1H carried 2u
+# on the weakest case in the book (+9.5% ROI, t=+1.24, bootstrap CI spanning
+# zero) while PROPS STANDARD carried 1u at +16.7% with a CI that excludes zero.
+#   play              stake   ROI     t      CI
+#   BIG-DOG 1H         2.00  +9.5%  +1.24  [-5.3%,+24.4%]  spans 0
+#   PROPS PRIME        2.16 +15.4%  +2.56  [+3.8%,+26.5%]
+#   PROPS PROBE        1.07 +17.1%  +2.01  [+0.5%,+33.2%]
+#   PROPS STANDARD     1.06 +16.7%  +2.14  [+1.1%,+32.0%]
+#   Q1 STANDARD        1.00 +13.7%  +1.31  spans 0
+#   SPREAD STANDARD    1.00 +22.0%  +2.02  [+0.8%,+43.2%]
+# Moving 1H 2u->1.5u and PROPS STANDARD 1u->1.5u holds TOTAL STAKE EXACTLY
+# constant (629u) while lifting the book +94.8 -> +97.6 u/szn, median $1,985 ->
+# $2,014, 5th %ile $1,023 -> $1,090 and P(losing season) 4.6% -> 3.6%. Pure
+# reallocation, not leverage.
+# ⚠️ SPREAD STANDARD was deliberately NOT raised despite the best 2-season ROI:
+# its EIGHT-season read is +0.7% / t=+0.14 / 4-of-8. Never let a short-window
+# CI outvote a longer one.
+BIGDOG_TIER, BIGDOG_UNITS = "BIG-DOG 1H", 1.5
 BIGDOG_MIN_SPREAD, BIGDOG_MIN_EDGE = 17.0, 6.0
 # The BIG-DOG 1H play is NOT capped at week 5 (the STANDARD 1H tier above is).
 # backtest/h1_saturation.py showed the same bounded-quantity mispricing as the
@@ -79,8 +97,12 @@ def _full_game_context() -> dict:
 
 
 def run() -> pd.DataFrame:
-    obs = load_1h_obs(PBP_SEASONS)
-    model = fit_ratings(obs, asof_week_idx=SEASON * SEASON_STRIDE + 1)
+    # Refit AS OF the upcoming week, including the live season once its
+    # play-by-play lands (features/epa_ratings.live_asof).
+    from features.epa_ratings import asof_seasons, live_asof
+    from picks.prop_picks import current_week
+    obs = load_1h_obs(asof_seasons(PBP_SEASONS, SEASON))
+    model = fit_ratings(obs, asof_week_idx=live_asof(SEASON, current_week()))
     match = team_matcher()
     full_game = _full_game_context()
 
@@ -131,6 +153,41 @@ def run() -> pd.DataFrame:
     return df
 
 
+STD_MAX_WEEK = 5     # STANDARD 1H is validated in weeks 1-5 ONLY
+
+
+def tiered(df: pd.DataFrame) -> pd.DataFrame:
+    """Tier and stake 1H plays. THE single source of truth for both the report
+    and the paper ledger.
+
+    Previously `main()` tiered inline and `paper_trades.import_1h` re-derived
+    its own selection, so the ledger staked BIG-DOG 1H at 1u instead of 2u
+    (`getattr(r, "units", 1.0)` on a frame that has no `units` column) and
+    under-recorded a +17.6 u/szn play by half — which also slowed compounding,
+    since unit size grows off realised ledger P&L.
+
+    It also applies the STANDARD week gate. The docstring and the emitted
+    report both say "weeks 1-5 only, no edge weeks 6-15", but nothing enforced
+    it and 1u STANDARD plays were emitted all season.
+    """
+    if df.empty:
+        return df
+    wk = df.attrs.get("week", 1)
+    if wk >= POSTSEASON_WEEK:
+        # Bowls/CFP are out of sample: every threshold here was fitted on the
+        # regular season, and bowl rosters are reshaped by opt-outs and the
+        # portal in ways the ratings cannot see. Emit nothing.
+        return df.iloc[0:0].assign(tier=TIER, units=UNITS)
+    bigdog = df[df.get("big_dog", False)].copy()
+    bigdog["tier"], bigdog["units"] = BIGDOG_TIER, BIGDOG_UNITS
+    if wk <= STD_MAX_WEEK:
+        std = df[df.edge.abs() >= EDGE_FLAG]
+        std = std[~std.index.isin(bigdog.index)].assign(tier=TIER, units=UNITS)
+    else:
+        std = df.iloc[0:0].assign(tier=TIER, units=UNITS)
+    return pd.concat([bigdog, std])
+
+
 def main() -> None:
     df = run()
     day = datetime.now(timezone.utc).date().isoformat()
@@ -140,11 +197,7 @@ def main() -> None:
                         "(they appear near game day).", encoding="utf-8")
         print("no 1H lines yet — run on game week.")
         return
-    bigdog = df[df.get("big_dog", False)].copy()
-    bigdog["tier"], bigdog["units"] = BIGDOG_TIER, BIGDOG_UNITS
-    std = df[df.edge.abs() >= EDGE_FLAG]
-    std = std[~std.index.isin(bigdog.index)].assign(tier=TIER, units=UNITS)
-    plays = pd.concat([bigdog, std]).sort_values(
+    plays = tiered(df).sort_values(
         ["tier", "edge"], key=lambda c: c if c.name != "edge" else c.abs(),
         ascending=[True, False])
     path.write_text(

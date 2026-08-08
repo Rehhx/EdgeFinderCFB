@@ -33,8 +33,14 @@ from ingestion.odds_client import NCAAF, OddsClient
 from picks.edge_report import payout, team_matcher
 
 MIN_SPREAD = 17.0          # base threshold; below this the book's rule is fair
-PREMIUM_SPREAD = 25.0      # where the linear rule breaks down badly
-PREMIUM_UNITS, STANDARD_UNITS = 2.0, 1.0
+# ⚠️ Q1 PREMIUM (>= 25) RETIRED 2026-08-06. On the de-contaminated sample it is
+# the one Q1 slice that fails outright — 56.0% / +8.0% pooled but bootstrap CI
+# [-7.3, +23.8] with 2025 NEGATIVE, and -0.7 u/szn realised. Those games are
+# NOT dropped: |spread| >= 25 is now bet as BIG-DOG 1H, which grades better on
+# exactly that population (9.5% ROI / 57.1%). Handing them over lifted 1H from
+# 3.7 to 14.6 u/szn and the whole book from +73.7 to +85.3.
+MAX_SPREAD = 25.0          # bet Q1 only in 17-25; >=25 belongs to 1H
+STANDARD_UNITS = 1.0
 MAX_EVENTS = 80
 
 
@@ -63,7 +69,7 @@ def run() -> pd.DataFrame:
     rows = []
     for e in events[:MAX_EVENTS]:
         fs = full.get(e["id"])
-        if fs is None or abs(fs) < MIN_SPREAD:
+        if fs is None or not (MIN_SPREAD <= abs(fs) < MAX_SPREAD):
             continue                      # only big mismatches
         dog = e["home_team"] if fs > 0 else e["away_team"]
         try:  # period markets need the per-event endpoint (bulk returns 422)
@@ -85,7 +91,11 @@ def run() -> pd.DataFrame:
         pts = pd.Series([q[1] for q in quotes])
         line = float(pts.mode().iloc[0])
         at = [q for q in quotes if q[1] == line]
-        best = max(at, key=lambda q: payout(pd.Series([q[2]])).iloc[0])
+        # payout() takes a SCALAR american price. Wrapping it in a Series made
+        # `if price < 0` ambiguous and raised for EVERY slate with a Q1 line,
+        # including single-quote ones — the best play in the book had never run
+        # against a live board.
+        best = max(at, key=lambda q: payout(q[2]))
         hid, aid = match(e["home_team"]), match(e["away_team"])
         rows.append({
             "commence": e["commence_time"][:10],
@@ -95,9 +105,9 @@ def run() -> pd.DataFrame:
             "fg_spread": fs, "dog": dog, "q1_line": line,
             "price": best[2], "book": best[0], "n_books": len(at),
             "ratio": round(line / abs(fs), 3),
-            "tier": "PREMIUM Q1" if abs(fs) >= PREMIUM_SPREAD else "STANDARD Q1",
-            "units": (PREMIUM_UNITS if abs(fs) >= PREMIUM_SPREAD
-                      else STANDARD_UNITS)})
+            "tier": "STANDARD Q1",
+            "units": STANDARD_UNITS,
+        })
     df = pd.DataFrame(rows)
     print(f"big-mismatch games with Q1 lines: {len(df)} "
           f"| credits left {client.remaining()}")
@@ -110,38 +120,33 @@ def main() -> None:
     path = PROJECT_ROOT / "reports" / f"q1_picks_{day}.md"
     if df.empty:
         path.write_text(
-            f"# Q1 Spread Picks — {day}\n\nNo Q1 lines on big mismatches yet "
+            f"# Q1 Spread Picks - {day}\n\nNo Q1 lines on big mismatches yet "
             "(they post near game day).", encoding="utf-8")
-        print("no Q1 lines yet — run on game week.")
+        print("no Q1 lines yet - run on game week.")
         return
-    df = df.sort_values(["tier", "fg_spread"],
-                        key=lambda c: c if c.name != "fg_spread" else -c.abs())
-    n_prem = int((df.tier == "PREMIUM Q1").sum())
+    df = df.sort_values("fg_spread", key=lambda c: -c.abs())
     path.write_text(
-        f"# Q1 Spread Picks — {day}\n\n"
-        f"**Take the underdog on the first-quarter spread.**\n\n"
-        f"{n_prem} PREMIUM ({PREMIUM_UNITS:g}u) + {len(df)-n_prem} STANDARD "
-        f"({STANDARD_UNITS:g}u)\n\n"
-        "| tier | filter | 3-season | ROI | size |\n|---|---|---|---|---|\n"
-        f"| PREMIUM Q1 | full spread ≥{PREMIUM_SPREAD:g} | **75.5%** "
-        "(94 bets, 3/3 seasons) | +45.7% | 2u |\n"
-        f"| STANDARD Q1 | full spread {MIN_SPREAD:g}–{PREMIUM_SPREAD:g} | "
-        "61.9% (307 bets) | +20.0% | 1u |\n\n"
-        "*Books derive the Q1 line at ~0.289 × the full spread (linear, "
-        "R²=0.85), but the dog's actual Q1 deficit plateaus near 4 points "
-        "however big the spread — a quarter holds ~3–4 possessions a side, so "
-        "you cannot lose by 30 in it. The linear rule over-grants the dog "
-        "+1.9 pts at a 19-point spread and +4.3 at 37.*\n\n"
-        "**No model is used — blind selection beat model-selected in the "
-        "backtest (75.5% vs 73.3%). This is market structure, not our "
-        "ratings.**\n\n"
-        "⚠️ *Q1 spreads on big mismatches are low-limit markets; expect small "
-        "maximums. That is likely why they stay mispriced.*\n\n"
-        "⚠️ **Do not also bet the 1H line on the same game.** Q1 and 1H "
-        "outcomes agree 76% of the time (r=+0.51); 2u on each is closer to a "
-        "4u single position than to two bets. Q1 grades better at spreads "
-        "≥25 (+44.0% vs +26.7% for 1H); 1H is better at 21–25 (+23.1% vs "
-        "+11.4%).\n\n"
+        f"# Q1 Spread Picks - {day}\n\n"
+        "**Take the underdog on the first-quarter spread.**\n\n"
+        f"{len(df)} plays at {STANDARD_UNITS:g}u "
+        f"(full spread {MIN_SPREAD:g}-{MAX_SPREAD:g})\n\n"
+        "> **The >=25 PREMIUM tier was RETIRED 2026-08-06.** On the "
+        "de-contaminated sample it is the one Q1 slice that fails: 56.0% / "
+        "+8.0% pooled, bootstrap CI [-7.3, +23.8], **2025 negative**, -0.7 "
+        "u/szn realised. Those games are NOT dropped - bet them as BIG-DOG "
+        "1H, which grades better on exactly that population (+9.5% ROI). "
+        "Moving them lifted 1H from 3.7 to 14.6 u/szn and the book from "
+        "+73.7 to +85.3 units/season.\n\n"
+        "*Mechanism: books derive the Q1 line at ~0.289x the full spread, "
+        "but a quarter holds only ~3-4 possessions a side. NOTE the "
+        "saturation claim was overstated by the old contaminated sample - on "
+        "the full universe the dog Q1 deficit keeps falling (-3.4 to -10.2), "
+        "so the remaining 17-25 edge is smaller and less certain than once "
+        "advertised.*\n\n"
+        "**No model is used - blind selection beat model-selected.**\n\n"
+        "> Low-limit market; expect small maximums.\n\n"
+        "> **Do not also bet the 1H line on the same game** - Q1 and 1H "
+        "outcomes agree 76% of the time (r=+0.51).\n\n"
         + df.to_markdown(index=False), encoding="utf-8")
     print(f"report -> {path}")
     print(df.head(15).to_string(index=False))

@@ -26,11 +26,20 @@ OPT_RE = re.compile(
     r"<option value=[\"']s=([a-z0-9-]+)&amp;id=(\d+)[\"'][^>]*>([^<]+)</option>")
 
 
-def fetch(url: str, session: requests.Session) -> str:
-    r = session.get(url, timeout=30)
-    r.raise_for_status()
-    time.sleep(1.5)
-    return r.text
+def fetch(url: str, session: requests.Session, tries: int = 3) -> str:
+    """GET with retries. A silently dropped team is a permanently missing
+    depth chart for that week — 20 of 138 teams were being lost this way."""
+    last = None
+    for attempt in range(tries):
+        try:
+            r = session.get(url, timeout=30)
+            r.raise_for_status()
+            time.sleep(1.5)
+            return r.text
+        except requests.RequestException as e:
+            last = e
+            time.sleep(2.0 * (attempt + 1))     # back off, then try again
+    raise last
 
 
 def team_list(session: requests.Session) -> list[tuple[str, str, str]]:
@@ -64,8 +73,13 @@ def parse_chart(html: str) -> list[dict]:
 NAME_ALIASES = {
     "appalachian state mountaineers": "App State",
     "central florida knights": "UCF",
-    "connecticut huskies": "Connecticut",
+    "connecticut huskies": "UConn",
     "mississippi rebels": "Ole Miss",
+    # CFBD spells these with diacritics; Ourlads does not
+    "hawaii rainbow warriors": "Hawai'i",
+    "san jose state spartans": "San José State",
+    "louisiana-monroe warhawks": "UL Monroe",
+    "miami (ohio) redhawks": "Miami (OH)",
 }
 
 
@@ -99,7 +113,8 @@ def scrape() -> pd.DataFrame:
 
     teams = team_list(session)
     print(f"{len(teams)} teams in Ourlads dropdown")
-    all_rows = []
+    all_rows: list[dict] = []
+    missed: list[str] = []
     for i, (slug, tid, name) in enumerate(teams):
         cache = raw_dir / f"{slug}.html"
         if cache.exists():
@@ -109,17 +124,26 @@ def scrape() -> pd.DataFrame:
                 html = fetch(f"{BASE}/{slug}/{tid}", session)
             except requests.RequestException as e:
                 print(f"  miss {slug}: {e}")
+                missed.append(name)
                 continue
             cache.write_text(html, encoding="utf-8")
-        for row in parse_chart(html):
+        rows = parse_chart(html)
+        if not rows:
+            missed.append(name)
+        for row in rows:
             all_rows.append(row | {"team_name": name, "as_of": as_of})
         if (i + 1) % 25 == 0:
             print(f"  {i + 1}/{len(teams)} scraped")
 
     df = map_team_ids(pd.DataFrame(all_rows))
-    unmatched = df[df.team_id.isna()].team_name.nunique()
+    unmatched = sorted(df[df.team_id.isna()].team_name.unique())
     if unmatched:
-        print(f"  {unmatched} team names unmatched to CFBD ids")
+        print(f"  [!] {len(unmatched)} team names unmatched to CFBD ids: "
+              f"{unmatched}")
+    if missed:
+        print(f"  [!] {len(missed)} teams returned NO depth chart "
+              f"(permanently lost for this week): {missed}")
+    print(f"  captured {df.team_id.nunique()} of {len(teams)} teams")
 
     dest = PARQUET_DIR / "depth_charts.parquet"
     if dest.exists():  # keep history, replace same-day snapshot
@@ -130,5 +154,49 @@ def scrape() -> pd.DataFrame:
     return df
 
 
+MAX_SNAPSHOT_AGE_DAYS = 10   # weekly cadence + slack; louder than a silent stall
+
+
+def history() -> pd.DataFrame:
+    """Report the accumulated snapshot history and shout if it has stalled.
+
+    Depth charts are the ONLY as-of source for who is expected to play, and
+    they cannot be reconstructed after the fact — a week not captured is gone
+    forever. `models/props.py` shows player SHARE is 55% of the rush-attempt
+    error and the one component with real signal left to sharpen, but the
+    2023-25 backtest could not use depth charts at all because only two
+    snapshots existed, both from 2026-07. This function exists so the history
+    building toward 2027 fails LOUDLY rather than quietly.
+    """
+    dest = PARQUET_DIR / "depth_charts.parquet"
+    if not dest.exists():
+        print("[!] no depth_charts.parquet yet — run the scraper.")
+        return pd.DataFrame()
+    d = pd.read_parquet(dest)
+    snaps = (d.groupby("as_of")
+              .agg(rows=("player", "size"), teams=("team_id", "nunique"))
+              .sort_index())
+    print(f"depth-chart history: {len(snaps)} snapshots, {len(d):,} rows")
+    print(snaps.tail(12).to_string())
+    newest = pd.to_datetime(snaps.index.max())
+    age = (pd.Timestamp.now().normalize() - newest).days
+    if age > MAX_SNAPSHOT_AGE_DAYS:
+        print(f"\n[!] NEWEST SNAPSHOT IS {age} DAYS OLD — the weekly capture "
+              f"has stalled. Every missed week is permanently lost; depth "
+              f"charts cannot be backfilled.")
+    else:
+        print(f"\nnewest snapshot {newest.date()} ({age}d old) — healthy")
+    thin = snaps[snaps.teams < 100]
+    if len(thin):
+        print(f"[!] {len(thin)} snapshot(s) cover <100 teams (partial scrape): "
+              f"{list(thin.index)}")
+    return snaps
+
+
 if __name__ == "__main__":
-    scrape()
+    import sys
+    if len(sys.argv) > 1 and sys.argv[1] == "history":
+        history()
+    else:
+        scrape()
+        history()

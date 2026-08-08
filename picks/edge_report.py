@@ -4,8 +4,10 @@ Pulls current NCAAF spreads/totals/moneylines (The Odds API), predicts every
 game with the Phase-1 spread stack (EPA ratings + roster prior, full prior
 weight in week 1) and the game-sim totals model, and writes:
   - reports/edge_report_<date>.md   ranked edges + recommended plays
-  - warehouse/parquet/clv_log.parquet  our fair line + market now, so every
-    report run builds the CLV history to grade later against closing lines
+  - warehouse/parquet/clv_log.parquet  our fair line + the market now, to
+    grade later against closing lines. Written ONLY by this module's report
+    path, and only for games whose market number actually MOVED — importing
+    or pricing the board never writes (see append_clv).
 
   python -m picks.edge_report
 """
@@ -92,12 +94,24 @@ def market_consensus(events: list) -> pd.DataFrame:
             "ml_away_best": max(ml_away, key=payout) if ml_away else np.nan,
             "n_books": len(e.get("bookmakers", [])),
         })
-    return pd.DataFrame(rows)
+    # Always return the full schema. An empty board — preseason, the offseason,
+    # an API outage, or an exhausted key — otherwise produced a column-less
+    # frame and every caller died on `.home` with an AttributeError.
+    return pd.DataFrame(rows, columns=[
+        "event_id", "commence", "home", "away", "book_spread", "book_total",
+        "ml_home_best", "ml_away_best", "n_books"])
 
 
-def run() -> pd.DataFrame:
-    obs = load_game_obs(PBP_SEASONS)
-    ratings = fit_ratings(obs, asof_week_idx=SEASON * SEASON_STRIDE + 1)
+def run(log_clv: bool = False) -> pd.DataFrame:
+    """Price the board. Pass `log_clv=True` ONLY from the weekly report path —
+    reading the board must not write to the CLV history (see append_clv)."""
+    # Refit AS OF the upcoming week on data that includes the live season —
+    # this used to be frozen at preseason all year while the backtests refit
+    # weekly (see features/epa_ratings.live_asof).
+    from features.epa_ratings import asof_seasons, live_asof
+    from picks.prop_picks import current_week
+    obs = load_game_obs(asof_seasons(PBP_SEASONS, SEASON))
+    ratings = fit_ratings(obs, asof_week_idx=live_asof(SEASON, current_week()))
     priors = preseason_priors(SEASON, obs)
     pri_floor = priors.quantile(0.10)
     cpriors = coach_priors()
@@ -155,13 +169,53 @@ def run() -> pd.DataFrame:
         out.append(row)
     df = pd.DataFrame(out)
 
-    log = df.assign(as_of=datetime.now(timezone.utc).isoformat(),
-                    season=SEASON)
-    dest = PARQUET_DIR / "clv_log.parquet"
-    if dest.exists():
-        log = pd.concat([pd.read_parquet(dest), log], ignore_index=True)
-    log.to_parquet(dest, index=False)
+    if log_clv:
+        append_clv(df)
     return df
+
+
+# Market columns that define a distinct CLV observation. If none of these
+# moved, a new snapshot carries no information.
+CLV_KEY = ["home", "away", "commence"]
+CLV_MARKET = ["book_spread", "book_total", "ml_home_best", "ml_away_best"]
+
+
+def append_clv(df: pd.DataFrame) -> int:
+    """Log market state for later grading against closing lines.
+
+    Only rows whose market number has MOVED since that game's last snapshot
+    are kept. `run()` used to append every game on the board on every call,
+    unconditionally and before any report was written — and it is invoked four
+    ways per cycle (directly, via ml_value, via import-ml, via import-edges).
+    The shipped log held 2,036 rows describing 86 games, with 15 separate
+    `as_of` stamps for 2026-07-29 alone. Merely LOOKING at the board wrote
+    permanently.
+
+    Movement is the signal CLV exists to capture, so this de-duplicates rather
+    than rate-limits: a genuine line move is always recorded, an unchanged
+    board costs nothing.
+    """
+    dest = PARQUET_DIR / "clv_log.parquet"
+    fresh = df.assign(as_of=datetime.now(timezone.utc).isoformat(), season=SEASON)
+    old = pd.read_parquet(dest) if dest.exists() else None
+
+    if old is not None and len(old):
+        last = (old.sort_values("as_of")
+                   .groupby(CLV_KEY, as_index=False).last()[CLV_KEY + CLV_MARKET])
+        m = fresh.merge(last, on=CLV_KEY, how="left", suffixes=("", "_prev"))
+        unchanged = np.ones(len(m), dtype=bool)
+        for c in CLV_MARKET:
+            a, b = m[c], m[f"{c}_prev"]
+            unchanged &= ((a == b) | (a.isna() & b.isna())).values
+        # a game with no previous snapshot is always new, however it compares
+        seen = m[[f"{c}_prev" for c in CLV_MARKET]].notna().any(axis=1).values
+        fresh = fresh[~(unchanged & seen)]
+
+    added = len(fresh)
+    if added:
+        out = pd.concat([old, fresh], ignore_index=True) if old is not None else fresh
+        out.to_parquet(dest, index=False)
+    return added
 
 
 def write_report(df: pd.DataFrame) -> str:
@@ -234,8 +288,8 @@ def write_report(df: pd.DataFrame) -> str:
         ml_plays.to_markdown(index=False, floatfmt=".2f"),
         "\n## Edge improvement roadmap",
         "1. **Bet openers, grade at close** — our validated edge is the "
-        "market's early slowness; every run logs to clv_log.parquet, CLV is "
-        "the scoreboard.",
+        "market's early slowness; this report logs line MOVES to "
+        "clv_log.parquet, CLV is the scoreboard.",
         "2. **Line-shop every play** (worth ~1%+); this report already uses "
         "best ML price, spread/total shopping needs per-book output.",
         "3. **Props**: main lines are efficient (backtested −4%); attack via "
@@ -252,7 +306,8 @@ def write_report(df: pd.DataFrame) -> str:
 
 
 if __name__ == "__main__":
-    df = run()
+    # The weekly report is the ONE intentional CLV snapshot per run.
+    df = run(log_clv=True)
     write_report(df)
     playable = df[df.book_spread.abs() <= 21]
     sp = playable[playable.spread_edge.abs() >= SPREAD_FLAG]

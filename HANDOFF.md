@@ -4,7 +4,684 @@
 ## What this project is
 College football betting model targeting spreads, totals, moneylines, player props. Master plan: `CFB_PREDICTOR_PLAN.md` (read §8 build-order for statuses). Data inventory: `DATA_CATALOG.md`. User purchases: `GRAB_LIST.md` (Odds API 5M plan is LIVE).
 
+---
+
+# 🚨🚨 2026-08-05/06 AUDIT — READ THIS BEFORE ANY NUMBER BELOW
+
+**Three agents (operational dry-run, adversarial correctness audit, new-market
+research) plus follow-up work found and fixed a sample-selection artifact that
+had manufactured most of this book's headline edges.** Every ROI, unit and
+bankroll figure written before 2026-08-05 in this file is superseded. The
+sections below were left in place because their *reasoning* is still useful,
+but treat their magnitudes as void unless repeated here.
+
+## 1. THE BIG ONE — the game sample was selected on the OUTCOME
+
+`features/epa_ratings.py:37` keeps only plays with
+`wp_before.between(0.04, 0.96)` (a garbage-time filter, correct for ratings).
+`backtest/spread_baseline.py::game_table` then derived `away_id` from the
+offenses appearing in **surviving plays** and dropped games where that came
+back empty. In a wire-to-wire blowout every play is filtered, so **the entire
+game vanished from the sample**.
+
+| \|spread\| | games | kept | coverage | dog final (kept) | (dropped) |
+|---|---|---|---|---|---|
+| 0–7 | 1063 | 757 | 71.2% | −3.1 | −3.7 |
+| 21–25 | 142 | 102 | 71.8% | −19.9 | −25.2 |
+| **25+** | 182 | 103 | **56.6%** | **−27.9** | **−40.5** |
+
+**It manufactured the stated mechanism.** The claim was that the dog's Q1
+deficit plateaus near −4 however big the spread gets. Inside the sample it
+does (−3.84 / −3.72 / −4.74 / −3.99 / −4.06). On the full universe it keeps
+falling: −3.43 / −4.68 / −5.96 / −5.67 / **−10.16**. The quarter does not
+saturate — the filter deleted the games where the dog was buried early.
+
+**FIXED**: `game_table` now builds from the CFBD games table; play-by-play
+still decides ratings but never membership. Coverage is **100% in every spread
+band**. `spread_history` now sees 8,846 games across 8 seasons.
+
+Q1 big dog, |spread|≥25, median-price control:
+
+| sample | n | ATS | ROI | t | seasons | boot CI |
+|---|---|---|---|---|---|---|
+| old (contaminated) | 103 | 69.9% | +42.6% | +5.44 | all + | [+26.8, +57.3] |
+| **full universe** | 159 | 53.5% | **+8.6%** | **+1.17** | 2025 **−5.2%** | **[−5.4, +22.4]** |
+
+Reproduced two independent ways (a from-scratch regrade off CFBD ids, and the
+rebuilt pipeline at +8.0%). **It fails two of this repo's own rules** —
+positive every season, and a CI excluding zero.
+
+## 2. Bowls leaked into every early-season rating fit
+
+CFBD labels postseason games with LOW week numbers (PBP: all 48 of 2024's
+bowls as `week=1`; games table: `[1, 13, 14]` — not even self-consistent).
+With `week_idx = season*30 + week`, a season's bowls sorted BEFORE its own
+week 2 and carried **19–22% of every week-2 fit weight**. Fixed via
+`POSTSEASON_WEEK = 20` in `features/epa_ratings.py`. Verified: 0 leaked rows.
+**Always key on `seasonType`, never on the week value.**
+
+## 3. The live modules did not run the models the backtests measured
+
+Four separate instances, all now fixed:
+
+1. **Props.** `picks/prop_picks.py` built its own preseason-only projection —
+   no trailing EWMA, no opponent factor — and **nothing in `picks/` read
+   `prop_projections.parquet`**, while `model_coefs.json` shipped
+   recalibration slopes fitted on the *other* projection. Measured cost:
+   ~**+11.6 u/szn shipped vs +56.9 measured**.
+   **FIXED**: `models/props.py::build_table(future=…)` accepts synthetic rows
+   for unplayed games and `project_upcoming()` is the live entry point.
+   `opening_projections()` / `project_for_spread()` were **deleted** so no
+   second projector can drift again.
+   *Verified both directions, exactly*: projecting 2025 wk10 as if upcoming
+   reproduces `prop_projections.parquet` at **corr 1.0000, max diff 0.0000**
+   over 1,069 players; and `build_table()` with no future is **bit-identical**
+   (46,487 rows, max diff 0.00e+00).
+2. **Ratings frozen preseason** in `edge_report.py`, `first_half_picks.py` and
+   `ml_spread_picks.py` (the audit found two; `edge_report` was the third and
+   drives the spread picks) while backtests refit weekly.
+   **FIXED** via shared `asof_seasons()` / `live_asof()`. Live-vs-backtest
+   ratings: **corr 1.000000** after, **0.6104** before.
+   **AND the data feed was dead** — the refit had NO `bulk_pbp` step, and
+   `download_season` short-circuits to "cached" whenever the file exists,
+   which is wrong for the live season whose file grows weekly. Added
+   `pull_pbp_live()` with `force=True`; unfreezing without this changes
+   nothing.
+3. **Teaser tickets could never settle.** Legs stored Odds-API display names
+   ("Alabama Crimson Tide"); `settle()` keys first-half margins by CFBD school
+   ("Alabama"). **0 of 183 matched** → every ticket stayed `open` forever.
+   Fixed by storing school names resolved from team ids.
+4. **1H staked 2u plays at 1u** and the STANDARD tier had **no week gate**
+   despite "weeks 1–5 only" in its own report text. Fixed by factoring
+   `first_half_picks.tiered()` as the single source of truth for both the
+   report and the ledger.
+
+## 4. Two silent stalls froze the 2026 data pipeline
+
+- **Empty API responses were cached as answers.** `CFBDClient.get()` served a
+  cached `[]`, so `/roster` and `/player/returning` for 2026 were frozen at
+  zero rows *permanently* — the client never re-asked. Now an empty cached
+  payload is a cache MISS (cost: ~2 extra calls/run against a 1,000/mo quota).
+- **One optional stat blocked the required data.** `pull_cfbd_2026()` raised on
+  the first empty response and `returning_2026` was **first in the list**, so
+  `games_2026` and `lines_2026` were never pulled at all. **`lines_2026`
+  had never existed on disk.** Now each dataset pulls independently, split
+  required (games, lines) vs optional, and an empty pull never overwrites good
+  data.
+
+Recovering the blocked pull produced the **week-1 2026 slate**: 51 quoted
+games, **25 at |spread|≥17, 15 at ≥25**.
+
+## 5. `current_week()` reset every week-gated rule in December
+
+Because of the same postseason labelling, `current_week()` returned **1** from
+mid-December on — verified across the 2025 calendar (Nov 20→13, Dec 1→15,
+then Dec 15 / Dec 22 / Jan 2 all →**1**). That suppressed **all props** for
+bowl season (gate needs ≥5), reverted 1H to the loose 17-pt threshold, and made
+`live_asof` fit ratings as-of week 1 — discarding the whole season. Fixed.
+
+**Policy decision**: props and 1H now **suppress the postseason outright**
+(week ≥ 20). Bowls are out of sample for every threshold here, and the specific
+hazard is unmodellable — projections come from trailing usage while bowl
+rosters are gutted by opt-outs, the portal and long layoffs. The market prices
+that; we have no feature for it.
+
+## 6. ⚠️ A GRADING-ORIENTATION ERROR OF MY OWN — corrected 2026-08-06
+
+My first pass at re-deriving the spread tiers graded with `cover > 0`. But
+`cover = sign(margin + book_spread)` means the **HOME** team covered, and the
+dog is home in only **7%** of |spread|≥25 games — so I was measuring the
+FAVOURITE's cover rate and reporting it as the dog's. It **inverted both
+tiers**:
+
+| tier | I reported | actual (8 seasons) |
+|---|---|---|
+| PREMIUM ≥25 | 52.7%, +2.3%, 5-of-8 | **48.6%, −7.0%, t=−1.81, 2-of-8** |
+| STANDARD 17–25 | 45.0%, −11.9%, 1-of-8 | **52.7%, +0.7%, t=+0.14, 4-of-8** |
+
+Verified against the parquet's own graded `won` column: 100% agreement.
+**Grade against `won`, or check orientation on the minority side before
+trusting any per-side win rate.**
+
+## 7. SPREAD PREMIUM removed after a failed rescue (2026-08-06)
+
+22 pre-specified variants on 8 clean seasons; bar = positive EVERY season AND
+bootstrap CI excluding zero. **Nothing passed.**
+
+| variant | n | ATS | ROI | t | seasons + |
+|---|---|---|---|---|---|
+| shipped: dog, edge≥6 | 596 | 48.6% | −7.0% | −1.81 | 2/8 |
+| blind dog, no model | 830 | 49.9% | −4.6% | −1.40 | 3/8 |
+| fade the favourite | 596 | 51.4% | −1.9% | −0.49 | 4/8 |
+| all weeks 1–15 | 847 | 47.4% | −9.3% | **−2.87** | 2/8 |
+
+Three reasons this is a removal, not a re-tune: **blind beats model-selected**;
+**more edge is worse** (≥12 → −10.5%; the bulk of the sample, `dog_edge≥12`
+n=477, covers **46.8%** while low-edge games sit near 53% — anti-predictive
+selection); and **fading fails too** (51.4% vs a 52.4% break-even), so it is
+not a sign error, it is no edge. One slice looked great (HOME dogs 65.1%,
++24.3%, 6-of-8) — **rejected**: n=43, CI spans zero, and it is the 1-in-22 you
+expect from 22 looks.
+
+## 8. The bankroll sim described a book nobody was betting
+
+The week-block bootstrap resamples `(season, week)` blocks from a pooled set,
+so a simulated season inherited the POOL's play mix. Props were bet OOS only in
+2024–25, so a simulated season got **68%** of a real season's props while
+everything else got 102% — the printed book said **+72.6 u/szn** and the
+distribution underneath was drawn from **+54.9**. Fixed with
+`full_book_seasons()`, which *computes* the seasons containing every play and
+restricts both the table and the bootstrap to them. **Verified 100% agreement
+on every play.** The sim also staked SPREAD PREMIUM at 2u after the pick module
+had been cut to 1u — the sim must stake what the pick modules stake.
+
+## 9. ⭐ THE EDGE IS DECAYING — the most decision-relevant table here
+
+Forcing the table and the simulation onto the same population made this
+impossible to miss. `bankroll_sim.main()` now prints it FIRST:
+
+| play | 2023 | 2024 | 2025 |
+|---|---|---|---|
+| Q1 PREMIUM | +25.3 | +5.6 | **−6.9** |
+| BIG-DOG 1H | +16.3 | +1.9 | +5.6 |
+| SPREAD (removed) | +4.0 | −11.1 | **−22.9** |
+| TEASER 1H | +3.2 | +2.9 | **−2.9** |
+| **PROPS (all)** | n/a | **+57.9** | **+56.0** |
+
+**Every derived-line play peaks in 2023 and decays; props are the only stable
+one.** That is what a competed-away inefficiency looks like — or what a lucky
+2023 sample looks like. Either way the 3-season averages were carried by 2023.
+
+## 10. THE HONEST BOOK (supersedes every earlier bankroll number)
+
+**405 bets/season, +97.6 units/season.** At a 50% haircut, 1u = 2% of $1,000:
+
+| | median | 5th %ile | P(losing season) | median DD |
+|---|---|---|---|---|
+| **base case** | **$2,006** | **$1,090** | **3.6%** | **-16.4%** |
+
+For contrast the pre-audit claim was $1,956 with P(loss) 2.5%.
+
+| play | u/szn | status |
+|---|---|---|
+| PROPS PRIME | +37.4 | the book |
+| **BIG-DOG 1H** | **+14.6** | best derived play; inherited the >=25 games |
+| PROPS STANDARD | +11.1 | |
+| PROPS PROBE | +8.4 | |
+| SPREAD STANDARD 17-25 | +7.9 | unproven (8-szn +0.7%, t=+0.14) - kept for diversification |
+| Q1 STANDARD 17-25 | +5.8 | unproven - kept for diversification |
+| ~~Q1 PREMIUM >=25~~ | RETIRED | -0.7 u/szn; games handed to 1H |
+| ~~TEASER 1H~~ | OUT | -0.0 u/szn realised |
+| ~~SPREAD PREMIUM~~ | REMOVED | -7.0% over 8 clean seasons |
+
+### ⭐ Retiring a play was worth more than the play
+
+Dropping Q1 PREMIUM did not lose those games. `q1_bets()` now excludes >=25
+BEFORE `dedupe()`, so |spread| >= 25 flows to **BIG-DOG 1H**, which grades
+**+9.5% / 57.1%** on exactly that population. Result: 1H **+3.7 -> +14.6
+u/szn**, book **+73.7 -> +85.3**, on **46 FEWER bets**. Units per bet
+**0.163 -> 0.210 (+29%)**, P(loss) 14.6% -> 11.9%.
+
+### ⚠️ Do NOT strip the book down to props
+
+Props have by far the best per-bet ROI and are the only play with controlled
+evidence — but a props-only book is WORSE:
+
+| composition | bets/szn | u/szn | median | P(loss) |
+|---|---|---|---|---|
+| **full book** | 407 | **+85.3** | **$1,629** | **11.9%** |
+| props + BIG-DOG 1H | 290 | +60.7 | $1,400 | 21.8% |
+| PROPS ONLY | 252 | +56.9 | $1,372 | 23.1% |
+
+The unproven-but-positive plays pay for themselves in diversification.
+**"Fails the significance bar" is not the same as "remove from the portfolio".
+Remove plays with NEGATIVE or ZERO expectation (SPREAD PREMIUM, Q1 PREMIUM,
+teasers); KEEP positive-but-unproven ones at reduced size.** That distinction
+is what separates a portfolio decision from a significance test.
+
+## 11. Eight crash/correctness fixes in the live path
+
+| fix | why it mattered |
+|---|---|
+| `q1_picks` `payout(pd.Series(...))` | `if price < 0` ambiguous — crashed on EVERY live board, incl. single-quote. The best-advertised play had never run against real lines |
+| teaser leg names | 0 of 183 matched → tickets never graded |
+| `import-props` week gate | `flag_picks(df)` defaulted to NO gate; logged wks 1–4 props the research rejects |
+| 1H staking + STANDARD week gate | 2u play logged at 1u; STANDARD emitted all season |
+| `current_week()` off-by-one | 12 of 15 Sunday slots returned the FINISHED week (suppressed all props on the wk-5 slate) |
+| `_append` on empty market | KeyError on an ordinary Saturday |
+| `market_consensus([])` | column-less frame → AttributeError on any empty board / API outage |
+| cp1252 emoji | `bankroll` + `teasers` crashed under Task Scheduler and redirection |
+
+## 12. CLV log: reads must not write
+
+`edge_report.run()` appended every board game unconditionally and is invoked
+four ways per cycle — **2,036 rows describing 86 games, 15 `as_of` stamps for
+one day**. Now `run(log_clv=False)` by default (only the report path logs), and
+`append_clv()` keeps only rows whose market number actually **MOVED**.
+De-duplicate on the signal, not the clock: a real line move is always recorded,
+an unchanged board costs nothing. Verified: unchanged → 0 rows, 3 moved → 3.
+
+## 13. New markets researched — ALL REJECTED
+
+| market | verdict | the killing number |
+|---|---|---|
+| Q1 tie atom / 3-way | NO EDGE | atom is real (P(Q1 margin=0) **18.3%** vs 4.6% for a smooth normal, 4.0×) but priced: dog +0.5 covers 56.9% vs a 55.7% break-even |
+| Team totals | NO EDGE | the line is literally (total ∓ spread)/2, **corr 0.9951**; no saturation |
+| 1H team totals | NO EDGE | looked strong on the contaminated sample (+2.36 pts); **+0.25** on the full universe |
+| 1H total | NO EDGE | books *over*-ramp rather than hold constant (0.487+0.00171×\|spread\| vs true 0.504+0.00107) |
+| 1H moneyline | NO EDGE | mechanism real (dog half/game ratio 0.97→2.42) but priced; negative in 8 of 9 bands |
+| Synthetic Q2 | NO EDGE | quarter shares Q1 .266 / **Q2 .328** / Q3 .247 / Q4 .171, non-monotone cover, two vigs |
+
+## 14. What is still open
+
+- ~~**2026 rosters + returning production**~~ — ✅ **RESOLVED 2026-08-07.** CFBD
+  `/roster?year=2026` now returns **15,171 players** (was 0 on 08-04/05) and
+  `/player/returning` **136 teams** — the latter had *never* successfully
+  pulled. Both persisted: `roster_2026.parquet`, `returning_2026.parquet`, plus
+  `games_2026` 1,638 and `lines_2026` 103 refreshed, 26/1000 CFBD calls used.
+  `pull_cfbd_roster_2026()` had been raising on **every** refit run and now
+  returns clean. cfbfastR `rosters_2026.parquet` is still **404** — CFBD is the
+  source that came through, so the cfbfastR step will keep failing until they
+  publish (non-fatal, different schema, not used by vacated share).
+  ⚠️ This does **not** revive vacated share — that is rejected on betting
+  grounds (−16 u/szn), not blocked on data. `VACATED_MODE` stays `"off"`.
+  **The empty-cache fix from §4 is what made this work**: the client would
+  otherwise still be serving the cached `[]` from 08-04.
+- **Q1 betting limits** — still needs your account-level answer.
+- **`ml_spread_picks`** — week-gated to 1–5, flat 1u, PREMIUM excluded, marked
+  **PAPER ONLY**. Its old header claimed "+6.3% ROI vs linear +5.3%"; on clean
+  data both are below break-even (ML 50.5%/−3.6%, linear 51.4%/−1.9%).
+- **2026 `games` has no week 14 and no postseason** — this is NOT a bug. Tested
+  directly: `/games?year=2025` returns all 86 postseason games with no
+  `seasonType` param. 2026 is empty there because bowls, the CFP and
+  conference championships are not scheduled yet. **Confirm an API's default
+  before "fixing" a parameter you assume is missing.**
+
+## 15. ⭐ PARLAYS — props legs are exactly independent, but parlays buy CAPITAL EFFICIENCY, not units
+
+Measured 2026-08-06 on the 504 graded props bets (OOS 2024–25), mapped to games
+via `player_game_logs`.
+
+**Cross-game props legs are essentially exactly independent** — joint hit
+**36.8%** vs **36.8%** predicted from the marginals, **lift 0.999** over 6,212
+pairs. Parlay EV **+30.0%**, week-block bootstrap CI **[+11.3%, +48.6%]**,
+positive both seasons (+35.1% / +24.9%), P(EV≤0) 0.1%. Same-game pairs (n=232)
+also read independent at 0.991 — but only because `rec_yds` is excluded, so the
+obvious QB↔WR correlation never arises. **Keep one leg per game.**
+
+**The trap — pairing the SAME legs does not add units:**
+
+| strategy | tickets | staked | won | /szn | ROI |
+|---|---|---|---|---|---|
+| all singles (shipped) | 504 | 745u | +113.9u | **+56.9** | +15.3% |
+| pairs + leftover singles | 258 | 261u | +67.9u | **+34.0** | **+26.0%** |
+
+**Parlays double EV per DOLLAR STAKED, not per LEG.** Half the tickets at the
+same unit size deploys a third of the capital, so profit falls even as ROI
+nearly doubles. They add units only when **capital or book limits bind** —
+never when leg supply is the constraint.
+
+**When they win.** The shipped props schedule needs **34u/week average, 54u
+peak** — at 1u=2% of $1,000 that peak week risks **$1,080, i.e. 108% of
+bankroll**. So capital genuinely binds at a small bankroll. Median final
+bankroll by weekly-exposure cap:
+
+| weekly cap | singles | pairs | winner |
+|---|---|---|---|
+| 15% | $1,326 | **$1,443** | pairs |
+| 25% | $1,532 | **$1,629** | pairs |
+| 40% | **$1,838** | $1,680 | singles |
+| uncapped | **$2,160** | $1,678 | singles |
+
+**Crossover ≈ 30% of bankroll per week.** Run 40%+ through props weekly → bet
+singles. Cap exposure below ~30% → parlay.
+
+`picks/parlay_builder.py` was built on the opposite premise (Q1 legs "the best
+ingredient by a wide margin"; an explicit "NEVER props (near-efficient)").
+Both inverted by §1 — props are now its primary leg source, and its existing
+one-leg-per-game rule turns out to be load-bearing.
+
+## 16. VOLUME MARKETS (rush attempts / pass attempts / completions) — projections shipped, PAPER ONLY
+
+**We predict attempts better than the yards we actually bet**, because
+yards = attempts × efficiency and efficiency is the noisy factor bolted on:
+
+| quantity | corr | MAE/mean | vs | derived | corr | MAE/mean |
+|---|---|---|---|---|---|---|
+| rush attempts | **0.541** | 42.9% | | rush yards | 0.448 | 57.4% |
+| pass attempts | **0.454** | 34.5% | | pass yards | 0.358 | 38.4% |
+| targets | **0.491** | 47.7% | | receptions | 0.462 | 52.7% |
+
+`models/props.py::project()` now exposes **`proj_rush_att`, `proj_pass_att`,
+`proj_pass_comp`** — these numbers were always inside the yardage projections,
+just never surfaced. `features/player_stats.py` also now extracts `rush_td` /
+`rec_td` / `pass_td` from the PBP (free; they were always there). Verified the
+props backtest is bit-identical after both changes (46,487 rows, max diff
+0.00e+00).
+
+⚠️ **They must be recalibrated before use — raw projections run systematically
+LOW** (pass att: proj 23.9 vs actual 25.3). On a 50/50 line that bias alone
+would push us to the under every time. Fitted 2024 → tested 2025:
+
+| market | a | b | sigma | 2025 residual bias | MAE | naive MAE |
+|---|---|---|---|---|---|---|
+| rush_att | +0.58 | 0.939 | 5.27 | +0.35 | 4.09 | 4.08 |
+| pass_att | +2.75 | 0.936 | 11.06 | +0.29 | 8.53 | 8.61 |
+| pass_comp | +1.33 | 0.968 | 7.05 | +0.13 | 5.64 | 5.69 |
+
+Recalibration removes the bias but **barely beats naive on MAE**, and sigma is
+large (pass_att 11.1 on a mean of 25). So a real edge is plausible, not proven.
+
+⚠️ **THE DATA CONSTRAINT — read this before trusting any backtest here.**
+Traditional US books rarely post NCAAF attempts/completions, and **The Odds API
+historical archive has none** (probed 3 mid-season 2025 events across `us` and
+`us2`: `player_pass_tds` came back on 4–5 books every time; `rush_attempts`,
+`pass_attempts`, `pass_completions`, `kicking_points` returned **zero books**).
+That is a limitation of OUR DATA SOURCE, not proof the market does not exist —
+**DFS pick'em books (PrizePicks, Underdog, Sleeper) post exactly these lines**,
+typically near the median at roughly even money ("23.5 completions"). Those
+lines are set for engagement rather than sharp balance, which is where a model
+edge can live.
+
+**So these cannot be validated the way every other play here was.** The plan is
+FORWARD paper grading: log the line and our projection, grade from
+`player_game_logs` (which now carries attempts and completions), and decide
+after a real sample. Do not size them off the correlations above.
+
+### DFS LINE LOGGER — shipped 2026-08-06 (`ingestion/dfs_lines.py`)
+
+The forward-grading harness for §16, since those markets cannot be backtested.
+
+| source | status |
+|---|---|
+| **Underdog** | **LIVE.** Public unauthenticated JSON (`/beta/v6/over_under_lines`). Verified: 109 CFB lines logged on first run, 0 on re-run (append-only, records line MOVES — README rule #22). |
+| **PrizePicks** | **manual import.** Their API answers 403 behind a **DataDome CAPTCHA** (`geo.captcha-delivery.com`) — a deliberate access control, so this module does not try to defeat it. `import-pp FILE` normalises any CSV export into the identical schema and grades identically. |
+
+```
+python -m ingestion.dfs_lines fetch           # Underdog -> dfs_lines.parquet
+python -m ingestion.dfs_lines import-pp FILE  # PrizePicks CSV
+python -m ingestion.dfs_lines grade           # settle vs player_game_logs
+```
+
+Header matching is loose ("Stat Type" / "stat_type" / "stat type" all work) and
+**unmapped stat keys are LOGGED and printed, never dropped** — that is how we
+learn the real key names when CFB game props post. Verified end-to-end:
+`Pass Completions 23.5 -> pass_comp`, `Rush Attempts -> rush_att`, and
+`Longest Reception` correctly surfaced as unmapped.
+
+⚠️ **As of 2026-08-06 Underdog lists only SEASON-LONG CFB markets**
+(`season_pass_yards` etc.) — game props post nearer kickoff, so `grade` will
+report "no gradeable game props yet" until then. That is expected, not a fault.
+The payout structure already confirms the thesis: `over_mult` 1.00 /
+`under_mult` 1.00 at −112, i.e. **near-even money**, which is exactly the
+50/50-by-design pricing a model edge can attack.
+
+`grade()` settles the last line seen per (source, player, stat) against
+`player_game_logs`, attaches our projection, and reports the model's hit rate
+by source and stat. **Do not size these off backtest analogy — wait for the
+forward sample.**
+
+## 17. Passing TDs — REJECTED (free mechanism test)
+
+`player_pass_tds` IS quoted (4–5 books, every event probed) — and is
+unbettable. 4,227 QB games (pass_att≥15, 2023–25): mean **1.57** TD/game,
+observed sd **1.25**, and √1.57 = **1.25**. The variance is *entirely* Poisson
+counting error. Best predictor of the next game reaches **R²=0.039** (trailing
+pass yards) vs 0.097 for pass yards and 0.101 for pass attempts — the markets
+we actually beat. Same reason anytime-TD was rejected.
+
+**The probe cost ~70 credits and avoided a ~54,000-credit pull.** Free
+mechanism test first, then spend.
+
+## 18. WHY THE PROJECTIONS "FAIL" — the error tree (2026-08-06)
+
+**The market out-predicts us on every stat.** Our edge is NOT better central
+estimates; it is the recalibration, the distribution shape (gamma/NB tails),
+and a 30% model weight that disagrees with the book in the right places.
+
+| stat | our MAE | line MAE | we trail by |
+|---|---|---|---|
+| pass_yds | 69.37 | 63.90 | -5.47 |
+| rush_yds | 31.30 | 29.99 | -1.32 |
+| rec_yds | 27.46 | 26.11 | -1.35 |
+| receptions | 1.73 | 1.72 | -0.01 |
+
+**rush_yds MAE 29.16** = attempts (36% of error) x efficiency (28%)
+- attempts MAE 4.12 = **player SHARE 55%** + team volume 10%
+- share corr 0.596 | team corr 0.449 | **ypc corr 0.104**
+
+**pass_yds MAE 73.77** = attempts (29%) x efficiency (22%)
+- attempts MAE 8.22 = share 31% + team volume 34%
+- QB share corr **0.228** | team corr 0.425 | **ypa corr 0.122**
+
+Single-game efficiency is essentially unpredictable and contributes ~a quarter
+of the error. **That is irreducible, not a defect.**
+
+### Four improvement attempts, ALL REJECTED
+
+1. **Shrink efficiency harder** (its corr is ~0.10, so trust it less). The
+   shipped constants are already optimal — more shrinkage is strictly worse
+   (rush k=40 -> MAE 29.26, league-average-only 29.67; pass 74.58 -> 77.71).
+2. **Recalibrate the player share** (fit 2024, test 2025). Worse out of sample
+   on every stat: rush -2.4%, QB -3.7%, targets -1.1%.
+3. **Filter out high-line props.** Hit rate does fall with line size
+   (rush_yds 57.1% bottom quintile -> 50.7% top), but on the SHIPPED selection
+   the top quintiles are still positive in BOTH seasons (+9.8%/+9.9%) and
+   cutting them loses units (58.7 -> 49.2 u/szn).
+4. **Availability / staleness adjustment** — see below.
+
+### Depth charts + injury news: DEAD as a backtest input
+
+`depth_charts.parquet` holds **two as-of dates, both 2026-07-28/29** — one
+preseason snapshot, no history. `news_extractions.parquet` has **5 rows**.
+Neither can inform a 2023-25 fit without anachronism. `def_presence` /
+`key_db_absence` cover 2024-25 but are derived from who ACTUALLY appeared, so
+using them directly is leakage.
+
+The leak-free substitute WAS built: `gap` = weeks since the player's previous
+logged appearance (`shift(1)` only). A missed game leaves no log row, so the
+EWMA carries a stale pre-absence share into the return game. **The bias is real
+and stable in every season** — rush-share error at gap>=3: 2023 **-0.0704**,
+2024 -0.0411, 2025 -0.0237; target share -0.0158/-0.0158/-0.0083; correlation
+degrades 0.620 -> 0.550. QB share shows no gap effect (he starts or he does
+not).
+
+**Correcting it made the BOOK WORSE: -11.6 u/szn (+87.0 -> +75.4), PROPS PRIME
+ROI 15.4% -> 10.9% on the same 120 bets/szn.** Tested twice — raw multipliers,
+then normalised so only the RELATIVE penalty applied (gap1 forced to 1.000,
+gap2 0.970, gap3 0.920). Identical result. `GAP_MODE = "off"` in
+`models/props.py`, multipliers retained for reference.
+
+### ⭐ THE LESSON
+
+**A real bias in an input does not mean correcting it improves betting.** The
+recalibration slope and the market blend were fitted AROUND the uncorrected
+projection; changing the input shifts the whole EV surface and the selection
+with it. **Judge a projection change by the BOOK, never by the projection's own
+accuracy** — the same reason "the market out-predicts us" is compatible with a
+profitable model.
+
+### ⚠️ A selection trap that nearly shipped
+
+Filtering to QB games with `pass_att >= 15` shows we under-project QB share by
+**+0.1555 in 83.9% of games, stable across all three seasons**. It is
+conditioned on the OUTCOME — requiring 15+ attempts selects games where he
+played a lot. Unfiltered the bias is +0.026. Same family as §1.
+
+## 18b. ALL FIVE PROPS THRESHOLDS RE-SWEPT AND HELD (2026-08-06)
+
+Rule #17 fired: the §19 game-pinning fix changed the dataset. Every shipped cut
+survived — the second time they have held through a data change.
+
+| threshold | shipped | why the alternative fails |
+|---|---|---|
+| EV floor | 0.04 | 0.03 gives +60.5u pooled, but 0.03-0.04 is **-3.3% in 2025** |
+| PROBE/PRIME | 0.05 | monotone in the sweep -> leverage, not edge |
+| PRIME/STANDARD | 0.08 | best season balance (+59.4/+58.1) |
+| week gates | wk5 / wk9 | most units AND most balanced |
+| min books | >=2 | single-book bets grade 52.0% / +1.3% / t=+0.19, 2025 NEGATIVE |
+
+⚠️ **The n_books trap.** `n_books>=1` reads **+65.2 u/szn** vs +58.7, positive
+both seasons — apparently +6.5 units free. Graded ALONE those bets are
+**52.0%, +1.3%, t=+0.19, CI [-12.4%,+14.8%]**: 102 bets/szn of near-zero edge.
+The pooled units rise only because the bet COUNT does. With one book the market
+probability comes from the same quote we would bet, so there is no consensus to
+disagree with. **Grade a proposed expansion ON ITS OWN, never by the pooled
+total** — a pooled number cannot tell "more edge" from "more volume at zero
+edge".
+
+## 18c. WEEKLY DEPTH-CHART CAPTURE STARTED 2026-08-06 (a 2027 build)
+
+§18 showed player SHARE is 55% of the rush-attempt error and the only place
+real signal remains — but it needs as-of knowledge of WHO PLAYS, and the
+2023-25 backtest had none: `depth_charts.parquet` held TWO snapshots, both
+2026-07-28/29. **Ourlads publishes no history, so a week not captured is gone
+forever.** Capture therefore starts NOW even though it cannot help 2026.
+
+Fixed in `ingestion/scrapers/ourlads_depth.py`:
+- `fetch()` retries 3x with backoff — silent `RequestException` skips were
+  dropping ~20 of 138 teams per run. Coverage **116 -> 125 teams**.
+- Aliases for CFBD diacritics (`Hawai'i`, `San José State`) and `UConn` (the
+  old alias pointed at "Connecticut", a school name CFBD does not use).
+- Misses now print as "permanently lost for this week", not a quiet skip.
+- **`... ourlads_depth history`** lists every snapshot and SHOUTS if the newest
+  is >10 days old. A silent stall is the real risk here.
+
+Coverage 125/138 (91%). The missing 11 have no Ourlads chart at all (service
+academies plus a few MAC/Sun Belt) — upstream, not a bug.
+
+✅ **AUTOMATED 2026-08-06** — dedicated task **`CFB Depth Charts`**, registered
+and VERIFIED (started manually through Task Scheduler: `LastTaskResult 0`,
+snapshot written). Runs **Thursday AND Friday 10:00**, `StartWhenAvailable`,
+30-min limit, `MultipleInstances=IgnoreNew`. It calls the venv python directly
+with `WorkingDirectory` set — no cmd wrapper, so nothing to mis-quote.
+
+It is deliberately **independent of the Monday refit**: the refit also scrapes
+depth charts, but it is a ~20-minute job with many steps, and an unrelated
+failure there must not cost a week that can never be recovered. Two triggers a
+week is redundancy for the same reason. The Monday refit's own scrape is kept —
+it captures the POST-game state, which is a different and also useful as-of.
+
+⚠️ **CADENCE: capture THU/FRI, before the slate.** To project week W you need
+the chart as of just before week W's games. `august_refit` runs the scraper on
+MONDAY, which captures the POST-game state — useful, but not the right as-of.
+The README weekly routine now runs it Thu/Fri too.
+
+### 🚨 18c-bis. THE FIRST SCHEDULED RUN DID NOT FIRE (2026-08-07)
+
+The Friday 2026-08-07 10:00 trigger — the task's **first real unattended
+outing** — never ran. `LastRunTime` was still the 2026-08-06 23:33 manual test
+and `NextRunTime` had already rolled forward to Thu 2026-08-13. No snapshot was
+written for Friday.
+
+**The action is not the problem.** Started through Task Scheduler
+(`Start-ScheduledTask`, i.e. the registered action, not a hand-typed command
+line) it ran clean: `LastTaskResult 0`, **3,989 rows / 125 teams**, snapshot
+`2026-08-07` written. Same coverage as 08-06. So the venv path, the
+`WorkingDirectory` and the scrape all work unattended — **only the trigger
+failed**.
+
+**Cause: `LogonType=Interactive` + the machine was not available at 10:00.**
+Kernel-Power shows no activity between 2026-08-06 23:45 and 2026-08-07 20:55,
+so the box was off or asleep straight through the trigger. An Interactive task
+cannot fire with nobody logged on, and `StartWhenAvailable=True` had still not
+caught it up **two hours** after the machine came back. This is exactly the
+failure the §18d **ACTION REQUIRED** S4U script exists to prevent — it is still
+un-run, so all three tasks are still Interactive.
+
+⚠️ **Nothing was lost this week** (the 08-06 snapshot covers it, and the season
+does not open until 08-29). Treat it as the free warning it is: the redundancy
+missed on its first attempt, in the pre-season, when it did not matter yet.
+
+### ⭐ AND THERE WAS NO EVIDENCE TO DIAGNOSE IT WITH
+
+`Microsoft-Windows-TaskScheduler/Operational` is **disabled by default** and had
+**0 records** — the whole cause had to be reconstructed from Kernel-Power
+timestamps. §18c calls a silent stall "the real risk here" and there was no log
+recording the stall. Enabling it also needs elevation, so
+`scripts/enable_task_s4u.ps1` now flips it on in the same admin run.
+
+**RULE: automating a job is not the same as being able to tell whether it ran.
+Turn the audit log on when you register the task, not after it fails.**
+`ourlads_depth history` is the second half of that — it SHOUTS when the newest
+snapshot is >10 days old, which is the check that actually catches this in
+season.
+
+## 18d. MONDAY REFIT VERIFIED (2026-08-06)
+
+`CFB August Refit`: Ready, **next run 2026-08-17 09:03**, weekly Mondays,
+`StartWhenAvailable=True`, `ExecutionTimeLimit=PT2H`. `LastTaskResult 267011`
+= SCHED_S_TASK_HAS_NOT_RUN, expected for a future task.
+
+**It would have failed its most important step.** `props_vs_book.py:522`
+printed U+26A0 — the last line of `fit_production()`, the final re-fit of the
+run. Task Scheduler redirects stdout to a log, so encoding is **cp1252**, which
+cannot encode it: line 521 writes the coefficients, line 522 raises
+`UnicodeEncodeError`, and `step()` records the props refit as **FAIL despite
+the work completing**. Fixed to ASCII, plus 3 more in research scripts;
+**repo-wide sweep now finds 0** cp1252-fatal print lines.
+
+⚠️ **The false negative worth remembering:** the first test showed
+`stdout.encoding = utf-8` and no crash, because this session sets
+`PYTHONIOENCODING='utf-8:surrogateescape'` in the process environment and
+`cmd.exe` inherited it. It is NOT in the user's persistent environment, so the
+task will not get it. **Clear the harness environment before verifying a
+scheduled task, or you are testing your shell.** (Em-dashes are safe — cp1252
+has them at 0x97; only characters outside cp1252 crash.)
+
+Verified under exact task conditions (`set PYTHONIOENCODING=`, `cmd /c`,
+`>> log 2>&1`): exit 0, no traceback.
+
+**Runtime:** `models.props` 206s, every other re-fit <6s, plus the ~4-min
+Ourlads scrape — comfortably inside PT2H.
+
+🚨 **ACTION REQUIRED — STILL UN-RUN, AND IT HAS NOW COST A RUN.** From an ADMIN
+PowerShell:
+
+    powershell -ExecutionPolicy Bypass -File scripts\enable_task_s4u.ps1
+
+All three tasks are `LogonType=Interactive` ("only when logged on"), so a run at
+09:03 defers to next logon if the machine is logged out — **which is precisely
+how the 2026-08-07 depth-chart trigger was missed (§18c-bis)**. The script
+switches them to **S4U** — runs whether or not you are logged on, **no password
+stored** — and enables the Task Scheduler Operational log in the same elevated
+run. S4U cannot reach credentialed network resources (mapped drives), but these
+tasks make outbound HTTPS only, so that is irrelevant here. Changing a
+root-folder task's principal REQUIRES ELEVATION; a normal session gets
+`Access is denied` (0x80070005), and so does `wevtutil sl` (exit 5, verified).
+The machine must still be powered on; `StartWhenAvailable=True` covers catch-up
+— though on 08-07 it had **not** caught up two hours after the machine returned,
+so do not rely on it alone.
+`CFB Splits Capture` is armed for 2026-08-26 11:07.
+
+## 19. PROP LINES ARE CORRECTLY PLAYER- AND GAME-MATCHED (verified 2026-08-06)
+
+Lines are genuinely player-specific: 2024 wk12 pass_yds had 433 quotes across
+48 players and **105 distinct lines**, correctly ordered by quality.
+`corr(line, actual)` +0.45..+0.50, `corr(line, proj)` up to +0.84.
+
+**One real bug found and fixed.** CFBD tags its week-0 kickoff weekend as
+`week = 1`, so **267 player-weeks carried TWO distinct game_ids** and a single
+quoted line was graded against BOTH (117 rows, 0.83%). `consensus_lines()` now
+pins one event per player-week and carries its kickoff; the projection merge
+keeps the game whose CFBD start time is nearest. **0 duplicates**, and the book
+rose +85.3 -> **+87.0 u/szn** because the double-graded rows were net negative.
+**A week number is not a game key.**
+
+## 20. PROPS HAIRCUT CORRECTED (2026-08-06)
+
+`PROPS_EXTRA_HAIRCUT` 0.20 -> **0.00**. The extra penalty was set when props
+were judged "measurably less certain"; the audit INVERTED that — props are the
+only play positive in both OOS seasons with all controls passed, while every
+derived play now sits inside its own confidence interval. Penalising the
+best-evidenced play hardest had the ranking backwards. Changes what we EXPECT,
+not what we bet.
+
+---
+
 ## Current state (all phases 0–3 + tooling built and backtested)
+
+> ⚠️ **SUPERSEDED 2026-08-05/06.** Every ROI/unit figure in this section was measured on the contaminated game sample (audit §1) and/or before the live-model fixes (§3). The reasoning still holds; the magnitudes do not. Current book: **§10**.
 | Piece | File | Status / headline result |
 |---|---|---|
 | Ingestion (CFBD, bulk PBP, rosters) | `ingestion/` | 2021–25 PBP, ~21/1000 CFBD calls used |
@@ -88,6 +765,8 @@ pooled is only t=−0.66 on its own; the case rests on 4-of-4 cell consistency,
 not significance. Re-check after 2026. `MIN_WEEK_PRIME=5`, `MIN_WEEK_STANDARD=9`.
 
 ## STABILITY AUDIT of the derived-line plays (`backtest/play_stability.py`, 2026-08-04)
+
+> ⚠️ **SUPERSEDED 2026-08-05/06.** Every ROI/unit figure in this section was measured on the contaminated game sample (audit §1) and/or before the live-model fixes (§3). The reasoning still holds; the magnitudes do not. Current book: **§10**.
 Props have fitted coefficients, so `props_stability.py` resamples their training
 data. These plays mostly do not — Q1 is deliberately model-free. What *was*
 fitted is the **thresholds and week splits**, chosen by looking at the data, so
@@ -177,6 +856,8 @@ region today** (the week gate, PRIME-year-round, the EV floor). Assume there are
 more: **any threshold tuned before 2026-08-04 is unverified until swept.**
 
 ## Bankroll projection — $1,000 start (`backtest/bankroll_sim.py`, **recomputed 2026-08-04**)
+
+> ⚠️ **SUPERSEDED 2026-08-05/06.** Every ROI/unit figure in this section was measured on the contaminated game sample (audit §1) and/or before the live-model fixes (§3). The reasoning still holds; the magnitudes do not. Current book: **§10**.
 De-duplicated book (one derived bet per game — Q1/1H/spread all ride the same
 dog, plus 2-team teasers): **409 bets/season, +126.9 units/season** after the
 2026-08-05 prop-line pull widening (was 354 / +110.5 on the smaller sample; was
@@ -356,8 +1037,8 @@ picks **0.31** vs fixed **0.30** — that ONE HUNDREDTH moves the season by
 **5.8 units and 30 bets**. "average" wins on units but splits 84.2/42.0 by
 season and needs a NEW discretionary `BLEND_BAND`; rejected on season balance.
 ⚠️ **`bankroll_sim` does NOT show this gain** — it bootstraps outcomes given a
-FIXED bet list, while the fix reduces uncertainty in *which bets exist*. Median
-stays $1,956; the forward uncertainty behind it is lower.
+FIXED bet list, while the fix reduces uncertainty in *which bets exist*. Median was unchanged at the time; the forward uncertainty behind it is
+lower. (That $1,956 is itself superseded — see audit §10, now $1,509.)
 **RULE: before refining an estimator, measure whether the objective can
 IDENTIFY the parameter. A flat surface means precision buys noise.**
 
@@ -383,6 +1064,8 @@ sensitive to. If books cut Q1 to $25 the base case drops toward $1,600 —
 **find out early which books take size on Q1 lines.**
 
 ## PARLAYS + COMPOUNDING — the growth plan (`backtest/growth_paths.py`, 2026-08-04)
+
+> ⚠️ **SUPERSEDED 2026-08-05/06.** Every ROI/unit figure in this section was measured on the contaminated game sample (audit §1) and/or before the live-model fixes (§3). The reasoning still holds; the magnitudes do not. Current book: **§10**.
 Built to answer "can $1,000 reach $5,000 in a season" with real graded outcomes.
 
 **Parlays are genuinely +EV — the edge MULTIPLIES**: `EV=(1+EV1)(1+EV2)-1`, so
@@ -433,6 +1116,8 @@ already hits 75.5% but is 31 bets/szn and cannot 5x alone; parlays buy edge by
 SPENDING hit rate (2-leg ~51%, 3-leg ~33%). No configuration gives both.
 
 ## ⭐ TEASERS — the high-HIT-RATE play (`backtest/teasers.py`, 2026-08-04)
+
+> ⚠️ **SUPERSEDED 2026-08-05/06.** Every ROI/unit figure in this section was measured on the contaminated game sample (audit §1) and/or before the live-model fixes (§3). The reasoning still holds; the magnitudes do not. Current book: **§10**.
 Parlays raise EV by SPENDING hit rate. Teasers do the opposite: buy points, hit
 rate goes UP. That is unusually cheap for us **because our edge IS a saturation
 effect** — the dog's sub-period deficit plateaus near 4 pts however big the full

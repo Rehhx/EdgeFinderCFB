@@ -9,31 +9,162 @@ survived control tests**, and a much longer list of plausible-looking edges that
 
 ---
 
-## Validated plays (backtested, controls passed)
+## 🚨 Read this first — the 2026-08-05/06 audit
 
-| Play | Rule | Win% | ROI | Size | Sample |
-|---|---|---|---|---|---|
-| **Q1 PREMIUM** ⭐ | Full \|spread\| ≥25 → take the dog on the **first-quarter** line | **75.5%** | **+45.7%** | 2u | 94 bets, 3/3 seasons |
-| **Q1 STANDARD** ⭐ | Full \|spread\| 17–25 → take the dog on the Q1 line | 61.9% | +20.0% | 1u | 307 bets, 3/3 seasons |
-| **BIG-DOG 1H** | \|spread\| ≥17 (wks 1–5) or ≥21 (wks 6+), model on dog ≥6, **bet the 1H line** | **65.7%** | **+25.9%** | 2u | 178 bets, 3/3 seasons |
-| **Big-dog spread PREMIUM** | \|spread\| ≥25, weeks 1–5, model on dog ≥6 | 62.3% | +18.8% | 2u | 302 bets, 8/8 seasons |
-| **Props PRIME band** | EV 5–8% (not higher — see below), **weeks 5+** | 61.0% | +15.5% | 2u | ~120/season |
-| **Props PROBE band** ⚠️ *new* | EV 4–5%, **weeks 5+** — only 2 seasons old, so staked down | 60.5% | +14.2% | 1u | ~60/season |
-| **1H standard** | Any side, edge ≥2, weeks 1–5 | 57.8% | +10.3% | 1u | 3/3 seasons |
-| **Big-dog spread STANDARD** | \|spread\| 17–25, weeks 1–5 | 56.9% | +8.6% | 1u | 8/8 seasons |
-| **Props STANDARD** | EV ≥8%, **weeks 9+ only** | 60.4% | +15.4% | 1u | ~72/season |
+**A sample-selection artifact had manufactured most of this project's headline edges,
+and it is now fixed.** The garbage-time play filter (`wp_before` ∈ [0.04, 0.96]) fed the
+*game universe*, not just the ratings, so any blowout in which every play was filtered
+**vanished from the sample entirely**. Membership was conditioned on the outcome.
 
-Realistic volume: **~252 props + ~70 Q1 + ~60 spread/1H bets per season**, de-duplicated to
-**409 bets and +126.9 units/season**. From $1,000 at 1u = 2% and a 50% edge haircut (70% on
-props): **median ~$1,956**, 5th percentile $1,167, 2.5% chance of a losing season.
+Coverage was **56.6%** at |spread| ≥25, and the deleted games were the ones where the dog
+got buried (mean final **−40.5** vs **−27.9** for those kept). That single filter
+produced the "the dog's Q1 deficit plateaus near 4 points" mechanism: flat at −3.8 → −4.1
+inside the sample, but **−3.4 → −10.2** across the real universe. The quarter never
+saturated.
+
+`game_table` now builds from the CFBD games table — play-by-play decides ratings, never
+membership. **Coverage is 100% in every spread band.** Full detail: `HANDOFF.md` §1–14.
+
+Everything below is re-derived on the clean universe. Old figures are void.
+
+## Validated plays (re-derived on the clean sample, 2026-08-06)
+
+| Play | Rule | u/season | Status |
+|---|---|---|---|
+| **Props PRIME** ⭐ | EV 5–8% (not higher), weeks 5+ | **+36.6** | the book — and the only play with stable, controlled evidence |
+| **BIG-DOG 1H** ⭐ | \|spread\| ≥17 (wks 1–5) / ≥21 (6+), model on dog ≥6, bet the 1H line | **+14.6** | best derived play; **inherited all the ≥25 games** from the retired Q1 tier |
+| **Props STANDARD** | EV ≥8%, weeks 9+ only | **+12.0** | |
+| **Props PROBE** | EV 4–5%, weeks 5+ | **+10.1** | staked down: newest evidence |
+| **Spread STANDARD** | \|spread\| 17–25, wks 1–5, model on dog ≥6 | +7.9 | ⚠️ 8-season read is +0.7%, t=+0.14, 4-of-8 — **unproven**, kept for diversification |
+| **Q1 STANDARD** | Full \|spread\| **17–25** → dog on the Q1 line | +5.8 | ⚠️ unproven, kept for diversification |
+| ~~Q1 PREMIUM ≥25~~ | ~~dog on the Q1 line~~ | **RETIRED** | −0.7 u/szn; CI [−7.3, +23.8], 2025 negative. Games handed to 1H |
+| ~~TEASER 1H~~ | ~~2-team +10 on 1H legs~~ | **OUT OF BOOK** | −0.0 u/szn realised; "83.8% / +30.3%" quoted the **joint** rate as the leg rate |
+| ~~Big-dog spread PREMIUM~~ | ~~\|spread\| ≥25~~ | **REMOVED** | 48.6% / −7.0% / t=−1.81 / 2-of-8 over 8 clean seasons |
+
+**405 bets and +97.6 units/season.** From $1,000 at 1u = 2% with a 50% edge haircut (70%
+on props): **median $2,006**, 5th percentile $1,090, **3.6%** chance of a losing season,
+median drawdown −16.4%. *(Pre-audit this claimed $1,956 and 2.5%.)*
+
+> ⭐ **Retiring a play can be worth more than the play was.** Dropping Q1 PREMIUM did not
+> lose those games — |spread| ≥25 now flows to BIG-DOG 1H, which grades **+9.5% / 57.1%**
+> on exactly that population. 1H went **+3.7 → +14.6 u/szn** and the book **+73.7 → +85.3**,
+> on **46 fewer bets**. Units per bet rose 0.163 → 0.215 (+32%).
+>
+> ⚠️ **But do not strip the book down to props.** Props have the best per-bet ROI, yet a
+> props-only book is *worse*: median $1,372 and **P(loss) 23.1%**, versus $1,641 and 12.5%
+> for the full book. The unproven-but-positive plays (Q1 STANDARD, SPREAD STANDARD) pay for
+> themselves in diversification. **"Fails the significance bar" ≠ "remove from the
+> portfolio" — remove plays with negative or zero expectation, keep positive-but-unproven
+> ones at reduced size.**
+
+> ✅ **Line-to-game integrity, verified 2026-08-06.** Prop lines are genuinely
+> player-specific: 2024 wk12 pass_yds had 433 quotes across 48 players and **105 distinct
+> lines**, correctly ordered by quality. `corr(line, actual)` runs +0.45–0.50 and
+> `corr(line, proj)` up to +0.84. **One real bug was found and fixed**: CFBD tags its
+> week-0 kickoff weekend as `week = 1`, so 267 player-weeks carried *two* game_ids and a
+> single quoted line was graded against **both** (117 rows, 0.83%). Lines are now pinned
+> to the game whose kickoff they were quoted for — 0 duplicates, and the book rose
+> +85.3 → **+87.0 u/szn** because the double-graded rows were net negative.
+> **A week number is not a game key.**
+
+### 🆕 Volume markets — projections shipped, PAPER ONLY
+
+**We predict attempts better than the yards we bet** (rush att corr **0.541** vs 0.448;
+pass att **0.454** vs 0.358; targets **0.491** vs 0.462) — because yards = attempts ×
+efficiency, and efficiency is the noisy factor bolted on. `models/props.py` now exposes
+`proj_rush_att`, `proj_pass_att`, `proj_pass_comp`; these numbers were always inside the
+yardage projections, just never surfaced.
+
+⚠️ **Recalibrate before use** — raw projections run systematically low (pass att: proj 23.9
+vs actual 25.3), which on a 50/50 line would push us to the under every time. Fitted
+2024→2025: `rush_att` b=0.939, `pass_att` b=0.936, `pass_comp` b=0.968; residual bias falls
+to +0.13…+0.35 but MAE barely beats naive, so a real edge is **plausible, not proven**.
+
+⚠️ **They cannot be backtested.** Traditional US books rarely post NCAAF attempts, and The
+Odds API's historical archive has **none** (3 mid-season 2025 events, `us` + `us2`:
+`player_pass_tds` returned 4–5 books every time; attempts/completions returned **zero**).
+That is a limit of *our data source*, not proof the market is absent — **DFS pick'em books
+(PrizePicks, Underdog, Sleeper) post exactly these lines**, near the median at roughly even
+money. Those are set for engagement rather than sharp balance, which is where a model edge
+can live. Plan: **forward paper grading** — log line + projection, grade from
+`player_game_logs` (which now carries attempts, completions and TDs).
+
+**Passing TDs are quoted and were rejected**: 4,227 QB games, mean 1.57 TD, observed sd
+1.25, √1.57 = 1.25 — the variance is *entirely* Poisson counting error. Best predictor
+R²=0.039 vs 0.097–0.101 for the markets we beat. The probe cost ~70 credits and avoided a
+~54,000-credit pull.
+
+### Why the projections "fail" — and four fixes that didn't work
+
+**The market out-predicts us on every stat** (pass_yds MAE 69.4 vs 63.9; rush 31.3 vs 30.0;
+receptions 1.73 vs 1.72). Our edge was never better central estimates — it's the
+recalibration, the gamma/NB tails, and a 30% model weight that disagrees in the right
+places. The error tree:
+
+| stat | attempts | efficiency | of the attempts error |
+|---|---|---|---|
+| rush_yds (MAE 29.2) | 36% | 28% | **player share 55%**, team volume 10% |
+| pass_yds (MAE 73.8) | 29% | 22% | share 31%, team volume 34% |
+
+Single-game efficiency is essentially unpredictable (ypc corr **0.104**, ypa **0.122**) and
+that quarter of the error is **irreducible**. Rejected, with evidence: shrinking efficiency
+harder (shipped constants already optimal), recalibrating player share (worse out-of-sample
+on all three), filtering out high-line props (top quintiles still positive both seasons),
+and an availability adjustment (below).
+
+> ⚠️ **Depth charts and injury news cannot be backtested here.** `depth_charts.parquet` has
+> **two as-of dates, both 2026-07-28/29** — one preseason snapshot, no history.
+> `news_extractions.parquet` has **5 rows**. The leak-free substitute — weeks since a
+> player's last appearance — was built and the bias it targets is **real and stable in every
+> season** (rush-share error at gap ≥3: −0.0704 / −0.0411 / −0.0237). **Correcting it still
+> cost −11.6 u/szn** (+87.0 → +75.4), tested both raw and normalised. `GAP_MODE = "off"`.
+>
+> ⭐ **The lesson: a real bias in an input does not mean correcting it improves betting.**
+> The recalibration and market blend were fitted *around* the uncorrected projection, so
+> changing the input shifts the whole EV surface. **Judge a projection change by the book,
+> never by the projection's own accuracy.**
+
+> ✅ **All five props thresholds re-swept 2026-08-06 and every one held** (rule 17 — the
+> game-pinning fix changed the dataset). EV floor 0.04, PROBE/PRIME 0.05, PRIME/STANDARD
+> 0.08, week gates 5/9, min books ≥2. Second time they've survived a data change.
+>
+> ⚠️ **The `n_books` trap.** Accepting single-book lines reads **+65.2 u/szn** vs +58.7,
+> positive both seasons — apparently free units. Graded *alone* those bets are **52.0% hit,
+> +1.3% ROI, t=+0.19, 2025 negative**: 102 bets/season of near-zero edge. The pooled total
+> rises only because the bet *count* does. With one book, the market probability we price
+> against comes from **the same quote we'd bet** — no consensus to disagree with.
+> **Grade an expansion on its own, never by the pooled total.**
+
+### ⭐ The edge is decaying — the most important table here
+
+| play | 2023 | 2024 | 2025 |
+|---|---|---|---|
+| Q1 PREMIUM | +25.3 | +5.6 | **−6.9** |
+| BIG-DOG 1H | +16.3 | +1.9 | +5.6 |
+| Spread (removed) | +4.0 | −11.1 | **−22.9** |
+| TEASER 1H | +3.2 | +2.9 | **−2.9** |
+| **PROPS (all)** | n/a | **+57.9** | **+56.0** |
+
+Every derived-line play peaks in 2023 and decays. **Props are the only stable one** — and
+now ~78% of the book. Treat every derived play as provisional and re-check it in 2026.
+
+### Why the big-dog spread play was removed
+
+22 pre-specified variants, 8 clean seasons, bar = positive every season **and** bootstrap
+CI excluding zero. **Nothing passed.** Blind (no model filter) *beat* model-selected
+(−4.6% vs −7.0%); raising the edge threshold made it **worse** (≥12 → −10.5%, and the bulk
+of the sample covers just 46.8% while low-edge games sit near 53%) — the model's confidence
+is anti-predictive there. Fading the favourite also fails (51.4% vs a 52.4% break-even), so
+it is not a sign error, it is no edge. One slice looked great (home dogs 65.1%, +24.3%) on
+**n=43** with a CI spanning zero — the 1-in-22 you expect from 22 looks.
 
 > ✅ **Widening the prop-line pull (2026-08-05) added 26% more data for 9,288 credits and
 > lifted props +40.5 → +56.9 units/season with no model change** — the single cheapest
-> improvement in the project. All five fitted props thresholds were then re-swept on the
-> enlarged sample and **every one held**, which is the first independent evidence they were
-> signal rather than fitted noise. From $1,000 at 1u = 2% and a 50% edge haircut (70% on
-props, which are measurably less certain): **median ~$1,811**, 5th percentile $1,132, 2.7%
-chance of a losing season, ~11% typical drawdown.
+> improvement in the project, and it survived the audit intact because props are graded
+> against real prop lines rather than the contaminated game sample. All five fitted props
+> thresholds were re-swept on the enlarged sample and **every one held**.
+> *(The bankroll figures once quoted here — $1,811 median — are superseded; see the table
+> above.)*
 
 > ⚠️ **PROBE is staked at 1u on purpose.** It grades best of any props tier (+21.4%, t=+2.32,
 > positive both seasons) but rests on two seasons and only became visible after the
@@ -50,18 +181,17 @@ chance of a losing season, ~11% typical drawdown.
 > 0.0%) but roughly **half** the old headline. It rebounds to **+30.0 u/szn** once the
 > season-arc gate is re-derived on clean data. Details in `HANDOFF.md`.
 
-> ✅ **Stability-audited 2026-08-04** (`backtest/play_stability.py`). Every play was swept
-> across neighbouring thresholds, re-run leaving each season out, re-priced at the *median*
-> quote, and block-bootstrapped. **A real structural edge is a plateau; a fitted one is a
-> spike at the exact number you chose.** Q1 is textbook — ROI climbs monotonically from
-> +23.3% at ≥19 to +64.1% at ≥31, which is what the saturation mechanism *predicts* rather
-> than something fitted. Q1 PREMIUM: LOSO +37.4/+51.6/+47.7%, bootstrap **+29.4 u/szn, 90%
-> CI [+11.0, +49.1]**. The biggest contributor is also the most robust play.
+> 🚨 **The 2026-08-04 stability audit is VOID — and it is the cautionary tale of this
+> project.** It swept thresholds, left each season out, re-priced at median, and
+> block-bootstrapped, then concluded Q1 was "textbook": ROI climbing monotonically from
+> +23.3% at ≥19 to +64.1% at ≥31, LOSO +37.4/+51.6/+47.7%, bootstrap +29.4 u/szn with a 90%
+> CI of [+11.0, +49.1]. Every one of those tests passed, and every one of them ran on a
+> sample that had already deleted the games where big dogs got buried.
 >
-> ⚠️ **The one weak link: BIG-DOG 1H in weeks 6–15** — only 49 bets in three seasons, 90% CI
-> [+0.7, +17.6] barely clearing zero, and the blind version scores a *higher* t-stat than the
-> model-filtered one. Kept (positive in every view, mechanism matches), but it is the first
-> thing to cut if the season starts badly, and must not be sized like Q1.
+> **No amount of resampling can detect a bias in which rows exist.** Bootstraps, LOSO, median
+> price and threshold plateaus all condition on the sample you hand them. The rule that would
+> have caught it is #18 — build the universe from a table of records — not another control
+> test. Q1 PREMIUM's real value on the clean sample is **−0.7 u/szn**.
 
 > ⚠️ The Q1 plays are a **market-structure edge, not model skill** — blind selection *beat*
 > model-selected in the backtest, so `picks/q1_picks.py` uses no ratings at all. They are
@@ -107,6 +237,8 @@ closing line in every season tested (PREMIUM 65.9% vs 62.9%). Run spread picks S
 
 ## ⭐ Teasers — the high-hit-rate play
 
+> ⚠️ **Numbers below predate the 2026-08-05/06 audit** and were measured on the contaminated game sample. The reasoning holds; the magnitudes do not. Current book is in *Validated plays* above; full detail in `HANDOFF.md` §1–14.
+
 Parlays raise EV by *spending* hit rate. Teasers do the opposite: you buy points, so the hit
 rate goes up. That is unusually cheap for us **because our edge is itself a saturation
 effect** — the dog's sub-period deficit plateaus near 4 points however large the full spread —
@@ -151,6 +283,8 @@ prices it independently. Verify the quoted price; most books correlation-adjust.
 
 ## Growth plan: compounding + parlays
 
+> ⚠️ **Numbers below predate the 2026-08-05/06 audit** and were measured on the contaminated game sample. The reasoning holds; the magnitudes do not. Current book is in *Validated plays* above; full detail in `HANDOFF.md` §1–14.
+
 Flat 2% staking is the honest way to *state* an edge, but it is not how you grow a bankroll.
 Two levers, both validated on real graded outcomes (`backtest/growth_paths.py`):
 
@@ -159,23 +293,40 @@ bets, no extra per-bet risk. Median $1,814 → $1,990 at the same 2%. Shipped in
 `picks/paper_trades.py`; every row records the dollar value of 1u at placement time so the
 history stays gradeable as the unit moves (`bankroll` / `backfill-units` commands).
 
-**Parlays** — the edge *multiplies*: `EV = (1+EV₁)(1+EV₂) − 1`, so two +45.7% Q1 legs price
-near +112%. Measured on same-week, different-game pairs:
+**Parlays — re-derived 2026-08-06 on props legs.** The old version of this section was
+built on Q1 legs ("two +45.7% Q1 legs price near +112%"); the audit put Q1 PREMIUM at
+−0.7 u/szn, so that is gone. Props legs replace it, and they are *cleaner*:
 
-| Composition | /szn | Win% | ROI | t | Per-season |
-|---|---|---|---|---|---|
-| **Q1 PREM × Q1 PREM** | 19 | 55.9% | **+103.8%** | +4.34 | +163/+61/+80% |
-| Q1 PREM × any derived | 31 | 50.0% | +84.5% | +4.39 | +93/+59/+101% |
-| any derived × any derived | 116 | 43.1% | +59.4% | +6.02 | +62/+70/+46% |
-| 1H × 1H | 23 | 37.1% | +37.3% | +1.73 | +55/+31/+30% |
+**Cross-game props legs are essentially exactly independent** — joint hit **36.8%** vs
+**36.8%** predicted from the marginals, **lift 0.999** across 6,212 pairs. Parlay EV
+**+30.0%**, week-block bootstrap CI **[+11.3%, +48.6%]**, positive both seasons. (The old
+"legs are not independent, 1.14× variance" warning applied to big-dog legs, which really
+were all the same structural bet. Props are not.)
 
-> ⚠️ **Legs are not independent.** Weekly win-rate variance is **1.14×** what independence
-> predicts — our big dogs win and lose together, because they are all the same structural
-> bet. True joint probability is slightly *below* p₁×p₂, so the win-rate haircut in
-> `parlay_builder.PROB` is load-bearing, not decoration.
+> ⚠️ **But parlays do not add units — they add capital efficiency.** Pairing the *same*
+> legs at the same unit size:
 >
-> ⚠️ **The 116/season row is not permission to bet that many.** It re-uses each leg ~3×, so
-> one leg losing takes down several parlays *and* the single on that game.
+> | strategy | tickets | staked | won | /szn | ROI |
+> |---|---|---|---|---|---|
+> | all singles (shipped) | 504 | 745u | +113.9u | **+56.9** | +15.3% |
+> | pairs + leftovers | 258 | 261u | +67.9u | **+34.0** | **+26.0%** |
+>
+> Half the tickets deploys a third of the capital, so profit falls even as ROI nearly
+> doubles. **Parlays double EV per dollar staked, not per leg.**
+
+**When to use them.** The props schedule needs **34u/week average, 54u peak** — at 1u=2% of
+$1,000 that peak week risks **108% of bankroll**, so capital really does bind. Median final
+bankroll by weekly-exposure cap:
+
+| weekly cap | singles | pairs |
+|---|---|---|
+| 15% | $1,326 | **$1,443** |
+| 25% | $1,532 | **$1,629** |
+| 40% | **$1,838** | $1,680 |
+| uncapped | **$2,160** | $1,678 |
+
+**Crossover ≈ 30% of bankroll per week.** Running 40%+ through props weekly → bet singles.
+Capping exposure below ~30% → parlay. One leg per game either way.
 
 **$1,000 → $5,000 is roughly a coin flip**, not a plan: compound 4% + 2-leg parlays gives a
 $3,916 median and **46.6%** chance of $5k — rising to **57.0%** if Q1 limits reach $200 across
@@ -188,6 +339,15 @@ but it is 31 bets a season and cannot 5x anything alone. Parlays buy edge by *sp
 rate — 2-leg ~51%, 3-leg ~33%. No configuration delivers both.
 
 ## Rejected after honest testing
+
+**New markets tested 2026-08-05, all rejected** — each killed by a free mechanism test
+before spending a credit: **Q1 tie / 3-way** (the atom is real, P(Q1 margin=0) 18.3% vs
+4.6% for a smooth normal, but priced — the dog +0.5 covers 56.9% against a 55.7%
+break-even); **team totals** (the line is literally (total ∓ spread)/2, corr 0.9951);
+**1H team totals** (+2.36 pts of apparent over-grant on the contaminated sample, **+0.25**
+on the full universe); **1H totals** (books *over*-ramp rather than hold a constant);
+**1H moneyline** (mechanism real, fully priced); **synthetic Q2** (Q2 takes 32.8% of the
+spread vs Q1's 26.6%, non-monotone, two vigs).
 
 Moneyline (−5% ROI), totals (dead across 10 seasons), anytime TD, `rec_yds` props, weather,
 rest/travel/altitude, coverage-injury (real on-field effect, zero betting edge),
@@ -299,6 +459,40 @@ These rules were each paid for with a fake result. See `HANDOFF.md` for the full
 17. **Re-derive every filter that was fitted on a region you later fixed.** The props week
     gate was tuned on weeks 1–5, which is where 81% of the sign-bug rows lived; on clean data
     the old rule was wrong and the corrected one is worth +6.5 units/season.
+18. **Never let a row filter decide which units of observation EXIST.** ⭐ The costliest rule
+    here. A garbage-time play filter also chose the game sample, so blowouts vanished and
+    every big-dog edge inflated. Guarding the *values* is not enough — the code even warned
+    that filtered plays give truncated scores, while the same truncation silently decided
+    which games were in the study. Build the universe from a table of records; use the
+    filtered data only for what it is for.
+19. **A backtest result is a claim about a specific estimator — make the live path IMPORT
+    it, never re-implement it.** Production ran a preseason-only props projection while the
+    backtest measured a trailing-EWMA one (~+11.6 u/szn shipped vs +56.9 measured), and live
+    ratings were frozen preseason while backtests refit weekly (corr 0.61). Two copies of a
+    decision always drift. When you cannot share code, diff the two outputs on the same input.
+20. **Grade against the authoritative column, and check orientation on the minority side.**
+    `cover > 0` means the *home* team covered; the dog is home in only 7% of |spread| ≥25
+    games, so grading dogs that way measured the favourite. It inverted both spread tiers in
+    a report. The parquet's own `won` column settled it.
+21. **An empty upstream response is a MISSING answer — never a cached fact, never a reason
+    to abandon unrelated work.** A cached `[]` froze two 2026 feeds permanently, and one
+    unpublished preseason stat blocked the schedule and betting-line pulls entirely. When a
+    guard's failure message is indistinguishable from correct behaviour, make it say how long
+    it has been failing.
+22. **Reads must not write.** Pricing the board appended to the CLV log — four callers per
+    cycle, 2,036 rows describing 86 games. And when you do log, **de-duplicate on the signal,
+    not the clock**: keep line *moves*, so a real move is always recorded and an unchanged
+    board costs nothing.
+23. **Make the report and the simulation describe the same population.** The bankroll sim
+    resampled week-blocks from a pool where props existed in only 2 of 3 seasons, so it
+    simulated a +54.9 u book while printing a +72.6 one.
+24. **Count your looks before believing the best slice.** 22 variants were tested to rescue
+    the big-dog spread play; the winner was home dogs at 65.1% on **n=43** with a CI spanning
+    zero. That is exactly what 22 looks buys you by chance.
+25. **Confirm an API's default before "fixing" a parameter you assume is missing.** An audit
+    reported that bowls could never enter the schedule for want of `seasonType=postseason`;
+    the endpoint returns them by default. The real December bug was elsewhere — CFBD labels
+    postseason games week 1/13/14, which reset every week-gated rule in the repo.
 
 ---
 
@@ -343,19 +537,31 @@ for `--cfbd` plus PBP for 2023–2025.
 python -m picks.ml_spread_picks              # early-season big-dog spreads
 python -m picks.paper_trades import-ml-spread
 
-# Tue — data refresh
+# Tue — data refresh. bulk_pbp MUST run weekly: the live season's file grows
+# every Saturday and the ratings refit as-of the upcoming week off it.
 python -m ingestion.run_ingest --all
+python -m ingestion.bulk_pbp 2026            # or: python -m scripts.august_refit
 python -m ingestion.scrapers.ourlads_depth
 python -m ingestion.news_injuries            # daily-ish
 
-# Wed — main board
+# Wed — main board.  `edge_report` is the ONLY thing that writes the CLV log,
+# and only for games whose number actually moved. Everything else reads.
 python -m picks.edge_report                  # spreads/totals + CLV log
 python -m picks.paper_trades import-edges
 
+# Thu-Sat — DFS pick'em lines (rush/pass attempts + completions live here,
+# NOT at traditional books). Append-only, logs line MOVES, safe to re-run.
+python -m ingestion.dfs_lines fetch
+
+# Thu/Fri — DEPTH CHART SNAPSHOT is AUTOMATED (scheduled task "CFB Depth
+# Charts", Thu+Fri 10:00). Nothing to run by hand. Check it is still alive:
+python -m ingestion.scrapers.ourlads_depth history   # shouts if >10 days stale
+python -m ingestion.dfs_lines import-pp pp_export.csv   # PrizePicks, manual
+
 # Fri/Sat — derived + props markets (they post late)
-python -m picks.q1_picks                     # Q1 dog on big mismatches (all year)
-python -m picks.first_half_picks             # 1H spreads, weeks 1-5 only
-python -m picks.prop_picks                   # PRIME all year; STANDARD wks 5+
+python -m picks.q1_picks                     # Q1 dog on big mismatches
+python -m picks.first_half_picks             # 1H: BIG-DOG all season, STANDARD wks 1-5
+python -m picks.prop_picks                   # nothing before wk5; STANDARD from wk9
 python -m picks.parlay_builder
 python -m picks.paper_trades import-1h
 python -m picks.paper_trades import-q1
@@ -367,7 +573,21 @@ python -m ingestion.bulk_pbp 2026
 python -m features.player_stats
 python -m picks.paper_trades settle          # DNP props void
 python -m picks.paper_trades report
+python -m ingestion.dfs_lines grade          # forward-grade the DFS volume markets
 ```
+
+**Automatic gates you do not have to remember** — all verified:
+`prop_picks` emits nothing before week 5 and no STANDARD before week 9;
+`first_half_picks` drops STANDARD after week 5; `ml_spread_picks` emits nothing
+after week 5 and is **paper only**; and **all props and 1H suppress the
+postseason entirely** (bowl rosters are gutted by opt-outs and the portal —
+unmodellable, and outside every threshold's fitted window).
+
+`current_week()` reads the CFBD schedule, takes the first game **strictly
+ahead**, and maps the postseason to week 20. Both details were bugs: a 2-day
+lookback made 12 of 15 Sunday/Monday runs report the week that had just
+*ended*, and CFBD's literal postseason week numbers (1/13/14) made December
+report **week 1**, which silently disabled every gate above.
 
 Paper ledger: `warehouse/paper_trades.parquet` (flat 1u stakes, CLV tracked).
 
@@ -575,9 +795,10 @@ How "pick Toledo +11.5 vs Michigan State, 1H" actually gets produced:
 3. features/roster_priors             → preseason prior           (week 1-5: prior-weighted)
 4. models/game_sim                    → fair line                 (Toledo +5.2 → edge 6.3)
 5. backtest/spread_history            → is this pattern real?     (|spread|≥17 + edge≥6:
-                                                                   56.9-62.3%, 8/8 seasons)
+                                                                   17-25 only; >=25 REMOVED,
+                                                                   48.6%/-7.0% on clean data)
    └─ writes thresholds ──────────────→ warehouse/model_coefs.json
-6. backtest/first_half                → same games, 1H line?      (64.8% — better still)
+6. backtest/first_half                → same games, 1H line?      (still the better of the two)
 7. picks/first_half_picks             → reads coefs + live 1H line
                                       → "BIG-DOG 1H, 2 units"     → reports/first_half_*.md
 8. picks/paper_trades import-1h       → ledger row, CLV logged

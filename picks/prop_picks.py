@@ -1,11 +1,15 @@
-"""In-season player-prop picks: opening projections vs live prop lines.
+"""In-season player-prop picks: model projections vs live prop lines.
 
-Projections for the upcoming week come from season-opening player priors
-(returning players + 2026 portal transfers carrying their old-school
-profiles) times expected team volume (prev-season pace, spread-adjusted).
-Pricing uses the backtest-validated stack: 2024-fitted recalibration,
-NB receptions, and the 0.2-model/0.8-market logit blend that was +4.2% ROI
-out-of-sample in 2025. Bets flagged at blended EV >= 3% with line shopping.
+Projections come from `models.props.project_upcoming()` — the SAME pipeline
+every backtest measures. It carries trailing (shift-1 EWMA) player share,
+team volume and efficiency, the season-opening priors that seed them, and the
+opponent allowed-efficiency factor. In week 1 there is no current-season form
+so it falls back to the priors alone; the advantage accumulates as in-season
+role changes do, which is the mechanism behind the season-arc gate below.
+
+Pricing uses the backtest-validated stack: recalibration, NB receptions,
+gamma tails on yardage, and the model/market logit blend. Bets flagged at
+blended EV >= MIN_EV with line shopping.
 
 Run on game week (props post a few days before kickoff):
   python -m picks.prop_picks
@@ -18,7 +22,6 @@ from scipy.stats import nbinom, norm
 
 from ingestion.config import CFBD_PARQUET_DIR, PARQUET_DIR, PROJECT_ROOT
 from ingestion.odds_client import NCAAF, PROP_MARKETS, OddsClient
-from models.props import player_priors
 from picks.edge_report import payout, team_matcher
 
 SEASON = 2026
@@ -53,10 +56,27 @@ MIN_EV = 0.04
 # The bankroll maths agrees with the caution: at 1u the change buys +$46 of
 # median for +0.9pp P(losing season); pushing it to 2u buys a further +$45 for
 # +1.3pp — a strictly worse trade, and on the newest evidence.
+# PER-STAT STAKE TILT (2026-08-06). rush_yds is the ONLY prop stat whose
+# bootstrap CI excludes zero, and it ranks #1 in ALL THREE seasons
+# (+23.8 / +21.7 / +17.5); pass_yds and receptions swap 2nd/3rd between
+# windows, so only the top rank is treated as signal. The mechanism agrees:
+# rush share (corr 0.596) and rush attempts (0.541) are the best-predicted
+# components in the whole model (HANDOFF §18).
+#
+# Validated OUT OF SAMPLE: a tilt ranked on 2023-24 and applied to 2025 alone
+# lifts ROI +15.4% -> +16.6% on slightly LESS stake. Through the book it is
+# +7.8 u/szn with median $1,872 -> $1,988, 5th %ile $957 -> $1,024 and
+# P(losing season) 5.7% -> 4.6% for only 4.5% more staked — better at BOTH
+# ends, which pure leverage never is.
+#
+# Multipliers are deliberately modest (not the sweep optimum of 1.5x, which
+# gains more units only by staking 17% more). PROVISIONAL: re-check after 2026.
+STAT_STAKE_MULT = {"rush_yds": 1.25, "pass_yds": 0.85, "receptions": 0.85}
+
 PROBE_LO, PROBE_HI = 0.04, 0.05
 PRIME_LO, PRIME_HI = 0.05, 0.08
 PROBE_UNITS = 1.0
-PRIME_UNITS, STANDARD_UNITS = 2.0, 1.0
+PRIME_UNITS, STANDARD_UNITS = 2.0, 1.5   # see the stake note above
 MAX_EVENTS = 80
 
 # The props edge RISES through the season (OOS 2024+2025, production metric):
@@ -93,6 +113,7 @@ MAX_EVENTS = 80
 # consistency, not significance. Re-check after 2026.
 MIN_WEEK_PRIME = 5
 MIN_WEEK_STANDARD = 9
+from features.epa_ratings import POSTSEASON_WEEK
 
 # fitted by backtest/props_vs_book.py + models/props.py; auto-loaded from
 # warehouse/model_coefs.json when present (scripts/august_refit.py refreshes)
@@ -104,8 +125,6 @@ RECAL = _props.get("recal", {
     "receptions": (1.02, 0.78, 2.11), "pass_yds": (101.17, 0.60, 84.72)})
 NB_R = _props.get("nb_r", 25)
 BLEND_W = _props.get("blend_w", 0.20)
-VOL_COEFS = load_coefs("prop_volume", {
-    "rush": (0.61, -0.05, 12.89), "pass": (0.77, -0.0, 6.89)})
 MARKET_TO_STAT = {
     "player_pass_yds": "pass_yds", "player_rush_yds": "rush_yds",
     "player_receptions": "receptions", "player_reception_yds": "rec_yds"}
@@ -116,57 +135,15 @@ EXCLUDE_STATS = ("rec_yds",)
 YARDAGE = ("rush_yds", "rec_yds", "pass_yds")  # right-skewed -> gamma tail
 
 
-def opening_projections() -> pd.DataFrame:
-    """Per (team_id, player): projected stats for a season-opening game."""
-    logs = pd.read_parquet(PARQUET_DIR / "player_game_logs.parquet")
-    pri = player_priors(logs)
-    pri = pri[pri.season == SEASON]
-
-    team_prev = logs[logs.season == SEASON - 1].groupby(
-        ["team_id", "game_id"], as_index=False).agg(
-        rush=("rush_att", "sum"), pas=("pass_att", "sum")) \
-        .groupby("team_id")[["rush", "pas"]].mean()
-    lg = logs[logs.season == SEASON - 1]
-    league = {
-        "ypc": (lg.rush_yds.sum() / lg.rush_att.sum()),
-        "ypt": (lg.rec_yds.sum() / lg.targets.sum()),
-        "catch": (lg.receptions.sum() / lg.targets.sum()),
-        "ypa": (lg.pass_yds.sum() / lg.pass_att.sum()),
-    }
-
-    pri = pri.join(team_prev, on="team_id")
-
-    def blend(prior, n, key, k):
-        return (prior.fillna(league[key]) * n + league[key] * k) / (n + k)
-
-    n_r = pri.prior_w * pri.prior_rush_att_pg.fillna(0)
-    n_t = pri.prior_w * pri.prior_targets_pg.fillna(0)
-    n_p = pri.prior_w * pri.prior_pass_att_pg.fillna(0)
-    pri["exp_rush_att_base"] = pri.rush
-    pri["exp_pass_att_base"] = pri.pas
-    pri["ypc_b"] = blend(pri.prior_ypc, n_r, "ypc", 40)
-    pri["ypt_b"] = blend(pri.prior_ypt, n_t, "ypt", 25)
-    pri["catch_b"] = blend(pri.prior_catch, n_t, "catch", 15)
-    pri["ypa_b"] = blend(pri.prior_ypa, n_p, "ypa", 80)
-    return pri
-
-
-def project_for_spread(pri: pd.DataFrame, team_id: int,
-                       team_spread: float) -> pd.DataFrame:
-    p = pri[pri.team_id == team_id].copy()
-    if p.empty:
-        return p
-    b0, b1, b2 = VOL_COEFS["rush"]
-    rush_att = b0 * p.exp_rush_att_base + b1 * team_spread + b2
-    b0, b1, b2 = VOL_COEFS["pass"]
-    pass_att = b0 * p.exp_pass_att_base + b1 * team_spread + b2
-    p["proj_rush_yds"] = p.prior_rush_share * rush_att * p.ypc_b
-    p["proj_targets"] = p.prior_tgt_share * pass_att
-    p["proj_receptions"] = p.proj_targets * p.catch_b
-    p["proj_rec_yds"] = p.proj_targets * p.ypt_b
-    p["proj_pass_yds"] = p.prior_qb_share * pass_att * p.ypa_b
-    return p
-
+# REMOVED 2026-08-05: opening_projections() / project_for_spread().
+# They were a SECOND, preseason-only implementation of the props model —
+# no trailing EWMA, no opponent factor — and run() used them, so the live
+# book was priced by a weaker model than every backtest measured while
+# model_coefs.json shipped slopes fitted on the OTHER one. Live now calls
+# models.props.project_upcoming(), the same pipeline the backtests use;
+# it reproduces prop_projections.parquet exactly on a past week (corr
+# 1.0000, max diff 0.0000 over 1,069 players). Do not reintroduce a
+# separate live projector — that drift is the bug.
 
 def p_over_model(stat: str, proj_raw: float, line: float,
                  mu_total: float | None = None) -> float:
@@ -195,10 +172,26 @@ def current_week(season: int = SEASON) -> int | None:
     path = CFBD_PARQUET_DIR / f"games_{season}.parquet"
     if not path.exists():
         return None
-    g = pd.read_parquet(path, columns=["week", "startDate"])
+    g = pd.read_parquet(path, columns=["week", "startDate", "seasonType"])
     g["start"] = pd.to_datetime(g.startDate, format="ISO8601", utc=True)
+    # CFBD labels EVERY postseason game `week=1`. Taken literally, that made
+    # this function return 1 from mid-December on — which suppressed all props
+    # (gate needs >=5), reverted 1H to the loose early-season threshold, and
+    # made the ratings refit as-of week 1, discarding the entire season at the
+    # moment it is most complete. Order the postseason AFTER the regular
+    # season, matching features/epa_ratings.POSTSEASON_WEEK.
+    from features.epa_ratings import POSTSEASON_WEEK
+    g["week"] = np.where(g.seasonType.astype(str) == "postseason",
+                         POSTSEASON_WEEK, g.week)
     now = pd.Timestamp.now(tz="UTC")
-    ahead = g[g.start >= now - pd.Timedelta(days=2)]
+    # STRICTLY ahead. A 2-day lookback kept Saturday's finished games "ahead",
+    # so 12 of 15 Sunday/Monday run-slots — the documented time to run this —
+    # returned the week that had just ENDED. Cost: all props suppressed on the
+    # week-5 slate (the first live week) and STANDARD suppressed on week 9 (the
+    # engine). Verified that strict does NOT advance mid-slate: it holds the
+    # current week through late games still in progress and only rolls over
+    # after the last whistle.
+    ahead = g[g.start >= now]
     if ahead.empty:                      # season over -> treat as late season
         return int(g.week.max())
     return int(ahead.sort_values("start").week.iloc[0])
@@ -217,9 +210,18 @@ def flag_picks(df: pd.DataFrame, week: int | None = None) -> pd.DataFrame:
     prime = out.ev.between(PRIME_LO, PRIME_HI, inclusive="left")
     out["tier"] = np.where(probe, "PROBE",
                            np.where(prime, "PRIME", "STANDARD"))
-    out["units"] = np.where(probe, PROBE_UNITS,
-                            np.where(prime, PRIME_UNITS, STANDARD_UNITS))
+    out["units"] = (np.where(probe, PROBE_UNITS,
+                             np.where(prime, PRIME_UNITS, STANDARD_UNITS))
+                    * out.stat.map(STAT_STAKE_MULT).fillna(1.0).values)
     if week is not None:
+        if week >= POSTSEASON_WEEK:
+            # Bowls/CFP are OUT OF SAMPLE for every threshold in this file —
+            # the season arc was fitted on weeks 1-15 of the regular season.
+            # And the specific hazard is one the model cannot see: projections
+            # come from trailing usage, while bowl rosters are gutted by
+            # opt-outs, portal departures and long layoffs. The market prices
+            # that; we have no feature for it. Do not bet it.
+            return out.iloc[0:0]
         if week < MIN_WEEK_PRIME:
             return out.iloc[0:0]          # no props edge exists this early
         if week < MIN_WEEK_STANDARD:
@@ -229,12 +231,54 @@ def flag_picks(df: pd.DataFrame, week: int | None = None) -> pd.DataFrame:
                            if s.name == "tier" else -s)
 
 
+def game_week(commence, season: int = SEASON):
+    """CFB week for a given kickoff date — the GAME's week, not today's.
+
+    Week gates must be evaluated per GAME. `current_week()` answers "what week
+    is it now", which is the right input for the ratings as-of fit but the
+    WRONG one for deciding whether a specific fixture is inside a play's
+    validated window: the live board routinely spans several weeks at once, so
+    gating the whole board on today's week both admits games past the window
+    and suppresses in-window games once the calendar rolls past them.
+    """
+    path = CFBD_PARQUET_DIR / f"games_{season}.parquet"
+    if not path.exists():
+        return None
+    g = pd.read_parquet(path, columns=["week", "startDate", "seasonType"])
+    g["d"] = pd.to_datetime(g.startDate, utc=True, format="ISO8601").dt.date
+    g["week"] = np.where(g.seasonType.astype(str) == "postseason",
+                         POSTSEASON_WEEK, g.week)
+    try:
+        d = pd.Timestamp(str(commence)[:10]).date()
+    except Exception:
+        return None
+    span = g.groupby("week").d.agg(["min", "max"])
+    hit = span[(span["min"] <= d) & (span["max"] >= d)]
+    return int(hit.index[0]) if len(hit) else None
+
+
+def _schedule() -> dict:
+    """(home_id, away_id) -> (game_id, week) for the live season."""
+    try:
+        g = pd.read_parquet(CFBD_PARQUET_DIR / f"games_{SEASON}.parquet")
+    except FileNotFoundError:
+        return {}
+    g = g[g.homeId.notna() & g.awayId.notna()].copy()
+    # Normalise the postseason week here too. `build_table`'s as-of guard drops
+    # every logged row at or after the earliest future week, so a bowl arriving
+    # as CFBD's literal `week=1` would wipe the whole season's trailing
+    # features instead of using them.
+    g["week"] = np.where(g.seasonType.astype(str) == "postseason",
+                         POSTSEASON_WEEK, g.week)
+    return {(int(r.homeId), int(r.awayId)): (float(r.id), float(r.week))
+            for r in g.itertuples()}
+
+
 def run() -> pd.DataFrame:
     client = OddsClient()
     events = client.get(f"/sports/{NCAAF}/odds",
                         {"markets": "spreads", "regions": "us"}, refresh=True)
     match = team_matcher()
-    pri = opening_projections()
     logit = lambda p: np.log(np.clip(p, 1e-4, 1 - 1e-4)
                              / (1 - np.clip(p, 1e-4, 1 - 1e-4)))
 
@@ -251,7 +295,13 @@ def run() -> pd.DataFrame:
     except Exception:
         pass
 
-    rows, with_props = [], 0
+    # PASS 1 — resolve every board game to ids and a market spread, then run
+    # the projection ONCE through models.props. This replaces a per-team call
+    # to a preseason-only projector that had no trailing form and no opponent
+    # factor: the live book was priced by a different, weaker model than every
+    # backtest measured. See models/props.py::project_upcoming.
+    sched, meta, grows = _schedule(), [], []
+    week = current_week() or 1
     for e in events[:MAX_EVENTS]:
         home_id, away_id = match(e["home_team"]), match(e["away_team"])
         if not home_id or not away_id:
@@ -260,7 +310,29 @@ def run() -> pd.DataFrame:
                    for mkt in bk.get("markets", []) if mkt["key"] == "spreads"
                    for o in mkt["outcomes"] if o["name"] == e["home_team"]]
         home_spread = float(np.median(spreads)) if spreads else 0.0
+        gid, wk = sched.get((int(home_id), int(away_id)),
+                            (float(hash((home_id, away_id)) % 10**8), float(week)))
+        meta.append((e, home_id, away_id, home_spread, gid, wk))
+        # team_spread is positive when THIS team is the underdog
+        grows += [
+            {"season": SEASON, "week": wk, "game_id": gid, "team_id": int(home_id),
+             "opp_id": float(away_id), "team_spread": home_spread},
+            {"season": SEASON, "week": wk, "game_id": gid, "team_id": int(away_id),
+             "opp_id": float(home_id), "team_spread": -home_spread}]
 
+    proj_all = pd.DataFrame()
+    if grows:
+        from models.props import project_upcoming
+        try:
+            proj_all = project_upcoming(pd.DataFrame(grows))
+        except Exception as exc:                 # never kill the whole report
+            print(f"  projection failed: {type(exc).__name__}: {exc}")
+    if proj_all.empty:
+        print("no projections available — cannot price props")
+        return pd.DataFrame()
+
+    rows, with_props = [], 0
+    for e, home_id, away_id, home_spread, gid, wk in meta:
         odds = client.get(f"/sports/{NCAAF}/events/{e['id']}/odds",
                           {"markets": ",".join(PROP_MARKETS), "regions": "us",
                            "oddsFormat": "american"}, refresh=True)
@@ -268,11 +340,11 @@ def run() -> pd.DataFrame:
             continue
         with_props += 1
 
-        home_side = project_for_spread(pri, home_id, home_spread)
-        away_side = project_for_spread(pri, away_id, -home_spread)
-        home_players = set(home_side.player)
-        proj = pd.concat([home_side, away_side])
-        proj_map = proj.set_index("player")
+        proj = proj_all[proj_all.game_id == gid]
+        if proj.empty:
+            continue
+        home_players = set(proj[proj.team_id == int(home_id)].player)
+        proj_map = proj.drop_duplicates("player").set_index("player")
 
         quotes = []
         for bk in odds["bookmakers"]:

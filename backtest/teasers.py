@@ -16,7 +16,7 @@ Two questions:
      higher than p1*p2 and the combination is mispriced in our favour. This
      measures the true joint rate so the gap is known before betting a cent.
 
-⚠️ Availability is the catch and it is not a modelling question: full-game and
+[!] Availability is the catch and it is not a modelling question: full-game and
 1H teasers are widely offered, Q1 teasers usually are NOT. The Q1 rows below
 are the ceiling of what this idea is worth, not a bet you can necessarily place.
 
@@ -104,7 +104,7 @@ def same_game(q1: pd.DataFrame, h1: pd.DataFrame) -> None:
     dec = 1 / indep if indep > 0 else np.nan
     print(f"\n  A book pricing this as independent offers ~{dec:.2f} decimal.")
     print(f"  True EV at that price: {joint * dec - 1:+.1%}")
-    print("  ⚠️ Most books apply a correlation adjustment to same-game combos,")
+    print("  [!] Most books apply a correlation adjustment to same-game combos,")
     print("  so treat this as the size of the prize IF you find one that does")
     print("  not — verify the actual quoted price before betting.")
 
@@ -156,7 +156,7 @@ def main() -> None:
     p_h1 = hit_rates(h1, "BIG-DOG 1H (teasers ARE widely offered)")
     teaser_ev(p_h1, "BIG-DOG 1H")
 
-    p_q1 = hit_rates(q1, "Q1 PREMIUM (⚠️ Q1 teasers rarely offered)")
+    p_q1 = hit_rates(q1, "Q1 PREMIUM ([!] Q1 teasers rarely offered)")
     teaser_ev(p_q1, "Q1 PREMIUM")
 
     rng = np.random.default_rng(3)
@@ -179,7 +179,7 @@ def main() -> None:
     print("\nREAD: teasers are the HIGH-HIT-RATE tool — they trade EV% for win%,")
     print("the exact opposite of parlays. If a teaser clears +EV here it is the")
     print("only structure in the book that pays AND wins 70-80% of the time.")
-    print("\n⚠️ BEFORE BETTING: confirm your book (a) offers 1H teasers at all,")
+    print("\n[!] BEFORE BETTING: confirm your book (a) offers 1H teasers at all,")
     print("(b) allows teasing a line this large, and (c) quotes a price at or")
     print("better than the break-even above. Availability is the binding")
     print("constraint here, not the edge.")

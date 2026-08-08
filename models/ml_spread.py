@@ -118,7 +118,7 @@ FEATS = ["epa_diff", "prev_diff", "ret_diff", "portal_diff", "recruit_diff",
          "sp_diff", "home"]
 
 
-def run() -> None:
+def run() -> "pd.DataFrame":
     df = build_features()
     print(f"early-season games (wks 1-5, {df.season.min()}-{df.season.max()}): "
           f"{len(df):,}")
@@ -155,6 +155,7 @@ def run() -> None:
         wr = won[g].mean()
         roi = (wr * 100 / 110 - (1 - wr)) * 100
         print(f"{name:10s} {mae:>7.2f} {int(g.sum()):>7} {wr:>7.1%} {roi:>+6.1f}%")
+    return d          # graded walk-forward frame, for threshold audits
 
 
 if __name__ == "__main__":

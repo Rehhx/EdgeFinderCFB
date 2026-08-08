@@ -92,7 +92,7 @@ def main() -> None:
           f"u/szn, bets {r3.bets.min()}-{r3.bets.max()}")
     print(f"\n  variance reduction: {1 - r3.u.std()/r.u.std():.0%}  "
           f"(sqrt(3) would predict ~42%)")
-    print("  ⚠️ Only the SPREAD is comparable here — the 3-season row is "
+    print("  [!] Only the SPREAD is comparable here — the 3-season row is "
           "in-sample,\n  so ignore its level entirely.")
 
 

@@ -32,7 +32,7 @@ At realistic prices the 1H TOTAL teaser lands ~65% joint vs a 64.3% break-even
 — essentially a coin flip, not a play. Only the 1H SPREAD teaser survives real
 pricing, because books apply standard full-game teaser prices to it.
 
-⚠️ ZERO-FLOOR ARTIFACT: teasing an OVER down on a small total quickly becomes
+[!] ZERO-FLOOR ARTIFACT: teasing an OVER down on a small total quickly becomes
 unloseable — at +10 the teased line is <=0 on 33.8% of Q1 games, at +14 on
 97.7%. Those rows are arithmetic, not edge. Only the UNDER side is meaningful.
 
@@ -163,7 +163,7 @@ def main() -> None:
     print("\nREAD: compare points/sd across the three. If the Q1/1H rows buy")
     print("more sd per point AND clear +EV where the full-game control does")
     print("not, the bounded-market teaser thesis generalises beyond spreads.")
-    print("\n⚠️ AVAILABILITY: sub-period TOTAL teasers are rarer than spread")
+    print("\n[!] AVAILABILITY: sub-period TOTAL teasers are rarer than spread")
     print("teasers. Confirm the market exists before treating any of this as")
     print("placeable — the edge is worthless if you cannot get the ticket down.")
 

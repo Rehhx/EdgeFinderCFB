@@ -82,6 +82,13 @@ def build(df: pd.DataFrame | None = None, pts: float = TEASE_PTS) -> pd.DataFram
             "line1": float(a.teased),
             "home2": b.home, "away2": b.away, "side2": b.side,
             "line2": float(b.teased),
+            # Carry team IDs so the ledger can store CFBD SCHOOL names. `home`/
+            # `away` above are Odds-API display names ("Alabama Crimson Tide"),
+            # and settle() keys first-half margins by CFBD school ("Alabama").
+            # Zero of 183 display names match, so every ticket stayed open
+            # forever — never graded, never in P&L, never compounding.
+            "home1_id": a.home_id, "away1_id": a.away_id,
+            "home2_id": b.home_id, "away2_id": b.away_id,
             "price": ASSUMED_PRICE, "units": TEASER_UNITS,
         })
     return pd.DataFrame(rows)

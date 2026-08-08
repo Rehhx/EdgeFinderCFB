@@ -105,7 +105,10 @@ def _append(led: pd.DataFrame, rows: list[dict]) -> pd.DataFrame:
         new["unit_usd"] = [
             _stake_usd(str(r.get("market", "")), float(r.get("stake", 1.0) or 0), u)
             for r in rows]
-    if len(led):
+    # `new` is column-less when a market has no qualifying play — an ordinary
+    # Saturday, not an error. Guarding only on len(led) made the dedup KeyError
+    # on the empty frame.
+    if len(led) and len(new):
         dupe_keys = led[["market", "pick", "commence"]].apply(tuple, axis=1)
         new = new[~new[["market", "pick", "commence"]].apply(tuple, axis=1)
                   .isin(set(dupe_keys))]
@@ -146,7 +149,11 @@ def import_1h() -> None:
         return
     teams = pd.read_parquet(CFBD_PARQUET_DIR / "teams_fbs.parquet")
     id2school = dict(zip(teams.id, teams.school))
-    plays = df[df.edge.abs() >= EDGE_FLAG]
+    # Use the SAME tiering as the report, so BIG-DOG 1H is staked at 2u and the
+    # STANDARD week gate applies. Re-deriving the selection here is what let
+    # the ledger drift from the published picks.
+    from picks.first_half_picks import tiered
+    plays = tiered(df)
     now = datetime.now(timezone.utc).isoformat()
     rows = [{
         "placed_at": now, "market": "1h_spread",
@@ -204,10 +211,21 @@ def import_teasers() -> None:
     """
     import json
     from picks.teaser_picks import build
+    print("[!] RESEARCH-ONLY as of 2026-08-06. The '83.8% hit / +30.3% EV' "
+          "headline quoted the JOINT rate as the LEG rate, on the contaminated "
+          "sample. Clean: leg 83.6%, JOINT 69.9% -> EV +8.8% at -180, and "
+          "-0.0 u/szn realised in the complete-book seasons (2024 +2.9, "
+          "2025 -2.9). Teasers also stack correlated exposure on games already "
+          "bet as 1H singles, so they are OUT of the book (bankroll_sim "
+          "TEASER_MODE='off'). Logged at stake 0 for tracking only.")
     df = build()
     if df.empty:
         print("no teaser-eligible 1H legs yet — run on game week.")
         return
+    # Legs MUST be stored under CFBD school names — that is what settle() keys
+    # its first-half margins by. See the note in teaser_picks.build().
+    teams = pd.read_parquet(CFBD_PARQUET_DIR / "teams_fbs.parquet")
+    id2school = dict(zip(teams.id, teams.school))
     now = datetime.now(timezone.utc).isoformat()
     rows = [{
         "placed_at": now, "market": "teaser2",
@@ -215,11 +233,14 @@ def import_teasers() -> None:
         "home_school": np.nan, "away_school": np.nan,
         "pick": f"{r.leg1}; {r.leg2}", "side": np.nan,
         "line": float(r.tease_pts), "price": float(r.price),
-        "stake": float(r.units), "model_p": np.nan, "edge": np.nan,
+        "stake": 0.0,  # research-only: tracked, not staked
+        "model_p": np.nan, "edge": np.nan,
         "status": "open", "pnl": np.nan, "clv_pts": np.nan,
         "legs": json.dumps([
-            {"home": r.home1, "away": r.away1, "side": r.side1, "line": r.line1},
-            {"home": r.home2, "away": r.away2, "side": r.side2, "line": r.line2},
+            {"home": id2school.get(r.home1_id), "away": id2school.get(r.away1_id),
+             "side": r.side1, "line": r.line1},
+            {"home": id2school.get(r.home2_id), "away": id2school.get(r.away2_id),
+             "side": r.side2, "line": r.line2},
         ]),
     } for r in df.itertuples()]
     save_ledger(_append(load_ledger(), rows))
@@ -244,7 +265,9 @@ def import_ml_spread() -> None:
         "pick": (r.home if r.edge > 0 else r.away),
         "side": "home" if r.edge > 0 else "away",
         "line": float(r.book_spread), "price": -110.0,
-        "stake": float(getattr(r, "units", 1.0)),  # PREMIUM tier = 2u
+        # Flat 1u across tiers now — PREMIUM measures negative on the
+        # de-contaminated sample (see picks/ml_spread_picks.py TIERS).
+        "stake": float(getattr(r, "units", 1.0)),
         "model_p": np.nan, "edge": float(abs(r.edge)),
         "status": "open", "pnl": np.nan, "clv_pts": np.nan,
     } for r in plays.itertuples()]
@@ -284,11 +307,15 @@ def import_parlay() -> None:
 
 def import_props() -> None:
     from picks.edge_report import team_matcher
-    from picks.prop_picks import flag_picks, run as prop_run
+    from picks.prop_picks import current_week, flag_picks, run as prop_run
     df = prop_run()
     if df.empty:
         return
-    picks = flag_picks(df)
+    # MUST pass the week. flag_picks(df) defaults to week=None, which disables
+    # the season-arc gate entirely — the ledger was logging weeks 1-4 props
+    # (negative in every band x season cell) while prop_picks itself correctly
+    # printed nothing. Silent: no traceback, just bets we researched away.
+    picks = flag_picks(df, current_week())
     match = team_matcher()
     now = datetime.now(timezone.utc).isoformat()
     rows = [{
@@ -538,12 +565,14 @@ def bankroll() -> None:
     if not led.empty:
         stale = int(led.unit_usd.isna().sum())
         if stale:
-            print(f"  ⚠️ {stale} row(s) predate compounding and have no "
+            # ASCII only: this runs under Task Scheduler and redirection, where
+            # the console is cp1252 and an emoji raises UnicodeEncodeError.
+            print(f"  [!] {stale} row(s) predate compounding and have no "
                   "unit_usd — they contribute $0. Backfill with "
                   "`backfill-units` if they are real bets.")
     open_n = int((led.status == "open").sum()) if not led.empty else 0
     if open_n:
-        print(f"  ⚠️ {open_n} bets still open — bankroll excludes them until "
+        print(f"  [!] {open_n} bets still open - bankroll excludes them until "
               "they settle")
 
 
